@@ -118,15 +118,24 @@ async def click_button(data: ButtonRequest):
                 email=email
             )
 
-        target_msg = None
+        target_msg = await find_button_message(
+            bot=bot,
+            message_id=data.messageId,
+            email=email
+        )
 
-        if data.messageId:
-            target_msg = await client.get_messages(bot, ids=data.messageId)
+        if not target_msg:
+            return fail("ไม่พบปุ่มจากบอท กรุณาขอโค้ดใหม่อีกครั้ง")
 
-        if not target_msg or not getattr(target_msg, "buttons", None):
-            return fail("ไม่พบปุ่มจากข้อความเดิม กรุณาขอโค้ดใหม่อีกครั้ง")
+        clicked = await click_target_button(
+            msg=target_msg,
+            row=data.row,
+            col=data.col,
+            button_text=button_text
+        )
 
-        await target_msg.click(data.row, data.col)
+        if not clicked:
+            return fail("กดปุ่มไม่สำเร็จ กรุณาตรวจ row/col หรือชื่อปุ่ม")
 
         return await wait_for_normal_result(
             bot=bot,
@@ -137,6 +146,54 @@ async def click_button(data: ButtonRequest):
 
     except Exception as e:
         return fail(str(e))
+
+
+async def find_button_message(bot, message_id: int = 0, email: str = ""):
+    if message_id:
+        try:
+            msg = await client.get_messages(bot, ids=message_id)
+            if msg and getattr(msg, "buttons", None):
+                return msg
+        except Exception:
+            pass
+
+    messages = await client.get_messages(bot, limit=30)
+
+    email_lower = email.lower().strip()
+    fallback_msg = None
+
+    for msg in messages:
+        if not getattr(msg, "buttons", None):
+            continue
+
+        text = (msg.message or "").lower()
+
+        if email_lower and email_lower in text:
+            return msg
+
+        if fallback_msg is None:
+            fallback_msg = msg
+
+    return fallback_msg
+
+
+async def click_target_button(msg, row: int = 0, col: int = 0, button_text: str = ""):
+    button_text = (button_text or "").strip().lower()
+
+    if button_text:
+        for row_index, button_row in enumerate(msg.buttons or []):
+            for col_index, button in enumerate(button_row):
+                current_text = (button.text or "").strip().lower()
+
+                if current_text == button_text or button_text in current_text or current_text in button_text:
+                    await msg.click(row_index, col_index)
+                    return True
+
+    try:
+        await msg.click(row, col)
+        return True
+    except Exception:
+        return False
 
 
 def build_faulty_command(button_text: str, email: str):
