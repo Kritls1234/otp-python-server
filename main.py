@@ -4,16 +4,17 @@ import asyncio
 from fastapi import FastAPI
 from pydantic import BaseModel
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
-SESSION_NAME = os.getenv("TG_SESSION", "otp_session")
+TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "")
 
 OTP_PATTERN = r"\b\d{4,8}\b"
 TIMEOUT_SECONDS = 60
 
 app = FastAPI()
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client = TelegramClient(StringSession(TG_STRING_SESSION), API_ID, API_HASH)
 lock = asyncio.Lock()
 
 
@@ -24,7 +25,7 @@ class OtpRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    await client.start()
+    await client.connect()
 
 
 @app.get("/")
@@ -43,6 +44,12 @@ async def get_otp(data: OtpRequest):
 
         if not bot_username:
             return {"success": False, "message": "ไม่มี BotUsername"}
+
+        if not await client.is_user_authorized():
+            return {
+                "success": False,
+                "message": "Telegram ยังไม่ได้ล็อกอิน ต้องใส่ TG_STRING_SESSION ก่อน"
+            }
 
         try:
             bot = await client.get_entity(bot_username)
