@@ -42,6 +42,10 @@ async def home():
     return {"status": "running"}
 
 
+def should_use_special_bot(bot_username: str) -> bool:
+    return bot_username.strip().lower() == SPECIAL_BOT
+
+
 @app.post("/get-otp")
 async def get_otp(data: OtpRequest):
     email = data.email.strip()
@@ -55,7 +59,9 @@ async def get_otp(data: OtpRequest):
         return fail("Telegram ยังไม่ได้ล็อกอิน")
 
     try:
-        if bot_username.lower() == SPECIAL_BOT:
+        bot = await client.get_entity(bot_username)
+
+        if should_use_special_bot(bot_username):
             return {
                 "success": False,
                 "needButton": True,
@@ -65,13 +71,13 @@ async def get_otp(data: OtpRequest):
                     {"text": "ยืนยันครัวเรือน", "row": 0, "col": 1},
                     {"text": "ลิงก์รีเซ็ตรหัสผ่าน", "row": 0, "col": 2}
                 ],
-                "messageId": 0
+                "messageId": 0,
+                "specialMode": True
             }
 
-        bot = await client.get_entity(bot_username)
         sent_msg = await client.send_message(bot, email)
 
-        return await wait_for_buttons_only(
+        return await wait_for_buttons_or_result(
             bot=bot,
             after_id=sent_msg.id,
             email=email
@@ -97,7 +103,7 @@ async def click_button(data: ButtonRequest):
     try:
         bot = await client.get_entity(bot_username)
 
-        if bot_username.lower() == SPECIAL_BOT:
+        if should_use_special_bot(bot_username):
             command_text = build_faulty_command(button_text, email)
 
             if not command_text:
@@ -148,32 +154,43 @@ def build_faulty_command(button_text: str, email: str):
     return None
 
 
-async def wait_for_buttons_only(bot, after_id, email):
+async def wait_for_buttons_or_result(bot, after_id, email):
     start_time = asyncio.get_event_loop().time()
     fallback_button_msg = None
+    fallback_result = None
 
     while True:
         if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
+            if fallback_result:
+                return fallback_result
+
             if fallback_button_msg:
                 return build_button_response(fallback_button_msg)
 
-            return fail("บอท Maker ไม่ส่งปุ่มกลับมา")
+            return fail("บอทไม่ส่งข้อมูลกลับมา")
 
-        messages = await client.get_messages(bot, limit=20)
+        messages = await client.get_messages(bot, limit=30)
         new_messages = [m for m in messages if m.id > after_id]
         new_messages.sort(key=lambda x: x.id)
 
         for msg in new_messages:
-            if not msg.buttons:
-                continue
-
             text = msg.message or ""
 
-            if email.lower() in text.lower():
-                return build_button_response(msg)
+            if msg.buttons:
+                if email.lower() in text.lower():
+                    return build_button_response(msg)
 
-            if fallback_button_msg is None:
-                fallback_button_msg = msg
+                if fallback_button_msg is None:
+                    fallback_button_msg = msg
+
+            result = extract_normal_code_or_link(msg, "ขอโค้ดเข้าสู่ระบบ")
+
+            if result:
+                if email.lower() in text.lower():
+                    return result
+
+                if fallback_result is None:
+                    fallback_result = result
 
         await asyncio.sleep(1)
 
