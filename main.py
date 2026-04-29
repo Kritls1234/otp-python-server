@@ -1,4 +1,6 @@
-import os, re, asyncio
+import os
+import re
+import asyncio
 from fastapi import FastAPI
 from pydantic import BaseModel
 from telethon import TelegramClient
@@ -13,7 +15,10 @@ SPECIAL_BOT = "@faultyhhbot"
 
 app = FastAPI()
 client = TelegramClient(StringSession(TG_STRING_SESSION), API_ID, API_HASH)
-lock = asyncio.Lock()
+
+# ล็อกแยกตามบอท
+bot_locks = {}
+bot_locks_guard = asyncio.Lock()
 
 
 class OtpRequest(BaseModel):
@@ -29,6 +34,15 @@ class ButtonRequest(BaseModel):
     buttonText: str = ""
 
 
+async def get_bot_lock(bot_username: str):
+    key = (bot_username or "").strip().lower()
+
+    async with bot_locks_guard:
+        if key not in bot_locks:
+            bot_locks[key] = asyncio.Lock()
+        return bot_locks[key]
+
+
 @app.on_event("startup")
 async def startup():
     await client.connect()
@@ -41,20 +55,20 @@ async def home():
 
 @app.post("/get-otp")
 async def get_otp(data: OtpRequest):
-    async with lock:
-        email = data.email.strip()
-        bot_username = data.botUsername.strip()
+    email = data.email.strip()
+    bot_username = data.botUsername.strip()
 
-        if not email:
-            return fail("ไม่มีอีเมล")
-        if not bot_username:
-            return fail("ไม่มี BotUsername")
-        if not await client.is_user_authorized():
-            return fail("Telegram ยังไม่ได้ล็อกอิน")
+    if not email:
+        return fail("ไม่มีอีเมล")
+    if not bot_username:
+        return fail("ไม่มี BotUsername")
+    if not await client.is_user_authorized():
+        return fail("Telegram ยังไม่ได้ล็อกอิน")
 
+    bot_lock = await get_bot_lock(bot_username)
+
+    async with bot_lock:
         try:
-            # กรณีพิเศษ: FaultyHHBot ไม่รอปุ่มจาก Telegram
-            # ให้เว็บเราแสดง 3 ปุ่มเองเลย
             if bot_username.lower() == SPECIAL_BOT:
                 return {
                     "success": False,
@@ -67,7 +81,6 @@ async def get_otp(data: OtpRequest):
                     ]
                 }
 
-            # บอทอื่นทำงานตามเดิม
             bot = await client.get_entity(bot_username)
             before_id = await get_latest_message_id(bot)
 
@@ -81,23 +94,24 @@ async def get_otp(data: OtpRequest):
 
 @app.post("/click-button")
 async def click_button(data: ButtonRequest):
-    async with lock:
-        email = data.email.strip()
-        bot_username = data.botUsername.strip()
-        button_text = (data.buttonText or "").strip()
+    email = data.email.strip()
+    bot_username = data.botUsername.strip()
+    button_text = (data.buttonText or "").strip()
 
-        if not email:
-            return fail("ไม่มีอีเมล")
-        if not bot_username:
-            return fail("ไม่มี BotUsername")
-        if not await client.is_user_authorized():
-            return fail("Telegram ยังไม่ได้ล็อกอิน")
+    if not email:
+        return fail("ไม่มีอีเมล")
+    if not bot_username:
+        return fail("ไม่มี BotUsername")
+    if not await client.is_user_authorized():
+        return fail("Telegram ยังไม่ได้ล็อกอิน")
 
+    bot_lock = await get_bot_lock(bot_username)
+
+    async with bot_lock:
         try:
             bot = await client.get_entity(bot_username)
             before_id = await get_latest_message_id(bot)
 
-            # กรณีพิเศษ: FaultyHHBot ใช้ command + email
             if bot_username.lower() == SPECIAL_BOT:
                 command_text = build_faulty_command(button_text, email)
 
@@ -107,7 +121,6 @@ async def click_button(data: ButtonRequest):
                 await client.send_message(bot, command_text)
                 return await wait_for_faulty_result(bot, before_id, button_text)
 
-            # บอทอื่นกดปุ่มตาม Telegram ปกติ
             messages = await client.get_messages(bot, limit=10)
 
             target_msg = None
@@ -127,7 +140,7 @@ async def click_button(data: ButtonRequest):
             return fail(str(e))
 
 
-def build_faulty_command(button_text: str, email: str) -> str | None:
+def build_faulty_command(button_text: str, email: str):
     t = button_text.strip().lower()
 
     if "เข้าสู่ระบบ" in t or "โค้ด" in t:
@@ -183,7 +196,7 @@ async def wait_for_normal_result(bot, before_id, selected_button):
 
         for msg in new_messages:
             text = msg.message or ""
-            result = extract_normal_code_or_link(text, selected_button)
+            result = extract_normal_result(text, selected_button)
             if result:
                 return result
 
@@ -234,7 +247,7 @@ def extract_faulty_result(text: str, selected_button: str):
     return None
 
 
-def extract_normal_code_or_link(text: str, selected_button: str):
+def extract_normal_result(text: str, selected_button: str):
     code_match = re.search(r"Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
     link_match = re.search(r"Link:\s*(https?://[^\s]+)", text, re.IGNORECASE)
 
