@@ -256,13 +256,14 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
 
                 return result
 
-            if not data.messageId:
-                return fail("ไม่พบเมนูเดิม กรุณาเริ่มใหม่อีกครั้ง", request_id)
+            target_msg = await find_button_message(
+                target=target,
+                message_id=data.messageId,
+                email=email
+            )
 
-            target_msg = await client.get_messages(target, ids=data.messageId)
-
-            if not target_msg or not getattr(target_msg, "buttons", None):
-                return fail("ไม่พบเมนูเดิม กรุณาเริ่มใหม่อีกครั้ง", request_id)
+            if not target_msg:
+                return fail("ไม่พบเมนู กรุณาลองใหม่อีกครั้ง", request_id)
 
             clicked = await click_target_button(
                 msg=target_msg,
@@ -377,6 +378,40 @@ async def wait_for_result(
         await asyncio.sleep(1)
 
 
+async def find_button_message(
+    target: Any,
+    message_id: int = 0,
+    email: str = ""
+) -> Optional[Any]:
+    if message_id:
+        try:
+            msg = await client.get_messages(target, ids=message_id)
+
+            if msg and getattr(msg, "buttons", None):
+                return msg
+        except Exception:
+            pass
+
+    messages = await client.get_messages(target, limit=35)
+
+    email_lower = clean_text(email).lower()
+    fallback_msg = None
+
+    for msg in messages:
+        if not getattr(msg, "buttons", None):
+            continue
+
+        text = clean_text(msg.message).lower()
+
+        if email_lower and email_lower in text:
+            return msg
+
+        if fallback_msg is None:
+            fallback_msg = msg
+
+    return fallback_msg
+
+
 async def click_target_button(
     msg: Any,
     row: int = 0,
@@ -453,12 +488,6 @@ def extract_code(text: str) -> Optional[str]:
 
     text = html.unescape(text)
 
-    # รูปแบบใหม่ 1:
-    # 🔑 Netflix Sign-in Code:
-    #
-    # 3724
-    #
-    # 🌍 Account Country:
     signin_match = re.search(
         r"Netflix\s*Sign[-\s]*in\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
         text,
@@ -470,12 +499,6 @@ def extract_code(text: str) -> Optional[str]:
         if code:
             return code
 
-    # รูปแบบใหม่ 3:
-    # 🔑 Netflix Travel Verify Code:
-    #
-    # 1863
-    #
-    # 🌍 Account Country:
     travel_match = re.search(
         r"Netflix\s*Travel\s*Verify\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
         text,
@@ -487,8 +510,6 @@ def extract_code(text: str) -> Optional[str]:
         if code:
             return code
 
-    # รูปแบบเดิมและรูปแบบทั่วไป:
-    # รองรับทั้งเลขหลัง label และเลขบรรทัดถัดไป
     label_patterns = [
         r"OTP\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
         r"Verification\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
@@ -505,17 +526,14 @@ def extract_code(text: str) -> Optional[str]:
         match = re.search(pattern, text, re.IGNORECASE)
 
         if match:
-            # เคสใหม่ต้องการเลข 4 หลักตรงตำแหน่งก่อน Account Country
             code_4 = extract_first_4_digit_code(match.group(1))
             if code_4:
                 return code_4
 
-            # สำรองสำหรับระบบเดิมที่อาจเป็น 5–8 หลัก
             code_any = extract_first_4_to_8_digit_code(match.group(1))
             if code_any:
                 return code_any
 
-    # fallback เดิม: ถ้าข้อความดูเหมือนเป็นข้อความรหัสจริง ค่อยจับเลข
     if looks_like_code_message(text):
         code_4 = extract_first_4_digit_code(text)
         if code_4:
@@ -563,8 +581,6 @@ def select_url_for_result(
     selected_text = clean_text(selected_button).lower()
     body_text = clean_text(text).lower()
 
-    # ฟังก์ชันเพิ่มเติมสำหรับระบบใหม่:
-    # Reset link มีปุ่ม URL 2 ปุ่มด้านล่าง ให้ดึง URL ของปุ่มแรกเสมอ
     if (
         "reset" in selected_text
         or "password" in selected_text
@@ -576,7 +592,6 @@ def select_url_for_result(
     ):
         return urls[0]
 
-    # ค่า default ก็ใช้ URL แรก เพื่อกันระบบที่มีหลายปุ่มแล้วต้องการปุ่มหลัก
     return urls[0]
 
 
@@ -609,9 +624,6 @@ def extract_urls_from_message(msg: Any) -> List[str]:
     for url in raw_url_matches:
         urls.append(url)
 
-    # สำคัญสำหรับระบบใหม่:
-    # ถ้าลิงก์อยู่ในปุ่ม ให้เก็บตามลำดับปุ่ม
-    # Reset link จะเลือก urls[0] ซึ่งคือ URL ของปุ่มแรก
     if getattr(msg, "buttons", None):
         for row in msg.buttons:
             for button in row:
