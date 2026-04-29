@@ -18,10 +18,9 @@ API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
 TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "")
 
-TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "35"))
-FALLBACK_GRACE_SECONDS = float(os.getenv("FALLBACK_GRACE_SECONDS", "2"))
-POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "0.5"))
-MESSAGE_FETCH_LIMIT = int(os.getenv("MESSAGE_FETCH_LIMIT", "15"))
+TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "60"))
+FALLBACK_GRACE_SECONDS = int(os.getenv("FALLBACK_GRACE_SECONDS", "5"))
+MAX_RETRY = int(os.getenv("MAX_RETRY", "1"))
 MAX_CONCURRENT_TELEGRAM_ACTIONS = int(os.getenv("MAX_CONCURRENT_TELEGRAM_ACTIONS", "5"))
 
 SPECIAL_BOT = "@faultyhhbot"
@@ -43,13 +42,12 @@ class ButtonRequest(BaseModel):
     col: int = 0
     buttonText: str = ""
     messageId: int = 0
-    specialMode: bool = False
 
 
 @app.on_event("startup")
 async def startup():
     if not API_ID or not API_HASH or not TG_STRING_SESSION:
-        logging.warning("Telegram environment variables are missing")
+        logging.warning("Telegram env is missing: TG_API_ID / TG_API_HASH / TG_STRING_SESSION")
 
     await client.connect()
     logging.info("Telegram client connected")
@@ -69,43 +67,48 @@ async def home():
     }
 
 
-@app.get("/health")
-async def health():
-    authorized = False
+def make_request_id() -> str:
+    return uuid.uuid4().hex[:10]
 
-    try:
-        authorized = await client.is_user_authorized()
-    except Exception:
-        authorized = False
 
-    return {
-        "success": True,
-        "status": "running",
-        "telegramConnected": client.is_connected(),
-        "authorized": authorized,
-        "timeoutSeconds": TIMEOUT_SECONDS,
-        "fallbackGraceSeconds": FALLBACK_GRACE_SECONDS,
-        "pollIntervalSeconds": POLL_INTERVAL_SECONDS,
-        "messageFetchLimit": MESSAGE_FETCH_LIMIT,
-        "maxConcurrentActions": MAX_CONCURRENT_TELEGRAM_ACTIONS
-    }
+def normalize_bot_username(bot_username: str) -> str:
+    bot_username = (bot_username or "").strip().lower()
+
+    if not bot_username:
+        return ""
+
+    if not bot_username.startswith("@"):
+        bot_username = "@" + bot_username
+
+    return bot_username
+
+
+def should_use_special_bot(bot_username: str) -> bool:
+    return normalize_bot_username(bot_username) == SPECIAL_BOT
+
+
+def attach_request_id(result, request_id: str):
+    if isinstance(result, dict):
+        result.setdefault("requestId", request_id)
+    return result
 
 
 @app.post("/get-otp")
 async def get_otp(data: OtpRequest):
     request_id = make_request_id()
 
-    email = clean_text(data.email)
-    bot_username = normalize_bot_username(data.botUsername)
+    email = data.email.strip()
+    bot_username_raw = data.botUsername.strip()
+    bot_username = normalize_bot_username(bot_username_raw)
 
     if not email:
-        return fail("กรุณากรอกอีเมลก่อนดำเนินการ", request_id)
+        return fail("ไม่มีอีเมล", request_id)
 
     if not bot_username:
-        return fail("ระบบยังไม่พบรายการที่ต้องการ กรุณาลองใหม่อีกครั้ง", request_id)
+        return fail("ไม่มี BotUsername", request_id)
 
     if not await client.is_user_authorized():
-        return fail("ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง", request_id)
+        return fail("Telegram ยังไม่ได้ล็อกอิน", request_id)
 
     async with telegram_semaphore:
         try:
@@ -117,7 +120,7 @@ async def get_otp(data: OtpRequest):
                 return {
                     "success": False,
                     "needButton": True,
-                    "message": "กรุณาเลือกเมนูที่ต้องการ",
+                    "message": "กรุณาเลือกบริการที่ต้องการ",
                     "buttons": [
                         {"text": "ขอโค้ดเข้าสู่ระบบ", "row": 0, "col": 0},
                         {"text": "ยืนยันครัวเรือน", "row": 0, "col": 1},
@@ -125,65 +128,51 @@ async def get_otp(data: OtpRequest):
                     ],
                     "messageId": 0,
                     "specialMode": True,
-                    "botUsername": SPECIAL_BOT,
                     "requestId": request_id
                 }
 
-            sent_msg = await client.send_message(bot, email)
-
-            result = await wait_for_buttons_or_result(
+            result = await run_normal_get_otp_with_retry(
                 bot=bot,
-                after_id=sent_msg.id,
                 email=email,
                 request_id=request_id
             )
 
             return attach_request_id(result, request_id)
 
-        except Exception:
+        except Exception as e:
             logging.exception(f"[{request_id}] get-otp error")
-            return fail("ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง", request_id)
+            return fail(str(e), request_id)
 
 
 @app.post("/click-button")
 async def click_button(data: ButtonRequest):
     request_id = make_request_id()
 
-    email = clean_text(data.email)
-    bot_username = normalize_bot_username(data.botUsername)
-    button_text = clean_text(data.buttonText)
+    email = data.email.strip()
+    bot_username_raw = data.botUsername.strip()
+    bot_username = normalize_bot_username(bot_username_raw)
+    button_text = (data.buttonText or "").strip()
 
     if not email:
-        return fail("กรุณากรอกอีเมลก่อนดำเนินการ", request_id)
+        return fail("ไม่มีอีเมล", request_id)
 
     if not bot_username:
-        return fail("ระบบยังไม่พบรายการที่ต้องการ กรุณาลองใหม่อีกครั้ง", request_id)
+        return fail("ไม่มี BotUsername", request_id)
 
     if not await client.is_user_authorized():
-        return fail("ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง", request_id)
+        return fail("Telegram ยังไม่ได้ล็อกอิน", request_id)
 
     async with telegram_semaphore:
         try:
             logging.info(
-                f"[{request_id}] click-button | bot={bot_username} | email={mask_email(email)} | "
-                f"row={data.row} | col={data.col} | buttonText={button_text} | "
-                f"messageId={data.messageId} | specialMode={data.specialMode}"
+                f"[{request_id}] click-button | bot={bot_username} | "
+                f"email={mask_email(email)} | row={data.row} | col={data.col} | "
+                f"buttonText={button_text} | messageId={data.messageId}"
             )
 
-            use_special = (
-                should_use_special_bot(bot_username)
-                or data.specialMode is True
-                or is_special_button_action(
-                    button_text=button_text,
-                    row=data.row,
-                    col=data.col,
-                    message_id=data.messageId
-                )
-            )
+            bot = await client.get_entity(bot_username)
 
-            if use_special:
-                bot = await client.get_entity(SPECIAL_BOT)
-
+            if should_use_special_bot(bot_username):
                 command_text = build_faulty_command(
                     button_text=button_text,
                     email=email,
@@ -192,21 +181,17 @@ async def click_button(data: ButtonRequest):
                 )
 
                 if not command_text:
-                    return fail("ระบบยังไม่พบเมนูที่ต้องการ กรุณาลองใหม่อีกครั้ง", request_id)
+                    return fail("ไม่รู้จักคำสั่งที่เลือก", request_id)
 
-                sent_msg = await client.send_message(bot, command_text)
-
-                result = await wait_for_faulty_result(
+                result = await run_special_command_with_retry(
                     bot=bot,
-                    after_id=sent_msg.id,
+                    command_text=command_text,
                     selected_button=button_text,
                     email=email,
                     request_id=request_id
                 )
 
                 return attach_request_id(result, request_id)
-
-            bot = await client.get_entity(bot_username)
 
             target_msg = await find_button_message(
                 bot=bot,
@@ -215,34 +200,242 @@ async def click_button(data: ButtonRequest):
             )
 
             if not target_msg:
-                return fail("ระบบยังไม่พบเมนูที่ต้องการ กรุณาลองใหม่อีกครั้ง", request_id)
+                return fail("ไม่พบปุ่มจากบอท กรุณาขอโค้ดใหม่อีกครั้ง", request_id)
 
-            clicked = await click_target_button(
-                msg=target_msg,
+            result = await run_normal_click_with_retry(
+                bot=bot,
+                target_msg=target_msg,
                 row=data.row,
                 col=data.col,
-                button_text=button_text
-            )
-
-            if not clicked:
-                return fail("ระบบยังไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
-
-            result = await wait_for_normal_result(
-                bot=bot,
-                after_id=target_msg.id,
-                selected_button=button_text,
+                button_text=button_text,
                 email=email,
                 request_id=request_id
             )
 
             return attach_request_id(result, request_id)
 
-        except Exception:
+        except Exception as e:
             logging.exception(f"[{request_id}] click-button error")
-            return fail("ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง", request_id)
+            return fail(str(e), request_id)
 
 
-async def wait_for_buttons_or_result(bot, after_id, email, request_id=""):
+async def run_normal_get_otp_with_retry(bot, email, request_id: str):
+    last_result = None
+
+    for attempt in range(MAX_RETRY + 1):
+        logging.info(f"[{request_id}] normal get attempt {attempt + 1}")
+
+        sent_msg = await client.send_message(bot, email)
+
+        result = await wait_for_buttons_or_result(
+            bot=bot,
+            after_id=sent_msg.id,
+            email=email,
+            request_id=request_id
+        )
+
+        if not is_retryable_fail(result):
+            return result
+
+        last_result = result
+
+        if attempt < MAX_RETRY:
+            logging.info(f"[{request_id}] normal get retrying")
+            await asyncio.sleep(2)
+
+    return last_result or fail("บอทไม่ส่งข้อมูลกลับมา")
+
+
+async def run_special_command_with_retry(bot, command_text, selected_button, email, request_id: str):
+    last_result = None
+
+    for attempt in range(MAX_RETRY + 1):
+        logging.info(f"[{request_id}] special command attempt {attempt + 1} | command={mask_command(command_text)}")
+
+        sent_msg = await client.send_message(bot, command_text)
+
+        result = await wait_for_faulty_result(
+            bot=bot,
+            after_id=sent_msg.id,
+            selected_button=selected_button,
+            email=email,
+            request_id=request_id
+        )
+
+        if not is_retryable_fail(result):
+            return result
+
+        last_result = result
+
+        if attempt < MAX_RETRY:
+            logging.info(f"[{request_id}] special command retrying")
+            await asyncio.sleep(2)
+
+    return last_result or fail("บอทไม่ส่งข้อมูลกลับมา")
+
+
+async def run_normal_click_with_retry(bot, target_msg, row, col, button_text, email, request_id: str):
+    last_result = None
+
+    for attempt in range(MAX_RETRY + 1):
+        logging.info(f"[{request_id}] normal click attempt {attempt + 1}")
+
+        if attempt == 0:
+            clicked = await click_target_button(
+                msg=target_msg,
+                row=row,
+                col=col,
+                button_text=button_text
+            )
+
+            if not clicked:
+                return fail("กดปุ่มไม่สำเร็จ กรุณาลองใหม่")
+
+            after_id = target_msg.id
+
+        else:
+            sent_msg = await client.send_message(bot, email)
+
+            button_result = await wait_for_buttons_or_result(
+                bot=bot,
+                after_id=sent_msg.id,
+                email=email,
+                request_id=request_id
+            )
+
+            if button_result.get("success") is True:
+                return button_result
+
+            if not button_result.get("needButton"):
+                last_result = button_result
+                continue
+
+            retry_message_id = button_result.get("messageId", 0)
+
+            retry_msg = await find_button_message(
+                bot=bot,
+                message_id=retry_message_id,
+                email=email
+            )
+
+            if not retry_msg:
+                last_result = fail("ไม่พบปุ่มจากบอทหลัง retry")
+                continue
+
+            clicked = await click_target_button(
+                msg=retry_msg,
+                row=row,
+                col=col,
+                button_text=button_text
+            )
+
+            if not clicked:
+                last_result = fail("กดปุ่มหลัง retry ไม่สำเร็จ")
+                continue
+
+            after_id = retry_msg.id
+
+        result = await wait_for_normal_result(
+            bot=bot,
+            after_id=after_id,
+            selected_button=button_text,
+            email=email,
+            request_id=request_id
+        )
+
+        if not is_retryable_fail(result):
+            return result
+
+        last_result = result
+
+        if attempt < MAX_RETRY:
+            logging.info(f"[{request_id}] normal click retrying")
+            await asyncio.sleep(2)
+
+    return last_result or fail("บอท Maker ไม่ส่งข้อมูลกลับมา")
+
+
+async def find_button_message(bot, message_id: int = 0, email: str = ""):
+    if message_id:
+        try:
+            msg = await client.get_messages(bot, ids=message_id)
+
+            if msg and getattr(msg, "buttons", None):
+                return msg
+
+        except Exception:
+            pass
+
+    messages = await client.get_messages(bot, limit=30)
+
+    email_lower = email.lower().strip()
+    fallback_msg = None
+
+    for msg in messages:
+        if not getattr(msg, "buttons", None):
+            continue
+
+        text = (msg.message or "").lower()
+
+        if email_lower and email_lower in text:
+            return msg
+
+        if fallback_msg is None:
+            fallback_msg = msg
+
+    return fallback_msg
+
+
+async def click_target_button(msg, row: int = 0, col: int = 0, button_text: str = ""):
+    button_text = (button_text or "").strip().lower()
+
+    if button_text:
+        for row_index, button_row in enumerate(msg.buttons or []):
+            for col_index, button in enumerate(button_row):
+                current_text = (button.text or "").strip().lower()
+
+                if (
+                    current_text == button_text
+                    or button_text in current_text
+                    or current_text in button_text
+                ):
+                    await msg.click(row_index, col_index)
+                    return True
+
+    try:
+        await msg.click(row, col)
+        return True
+
+    except Exception:
+        return False
+
+
+def build_faulty_command(button_text: str, email: str, row: int = 0, col: int = 0):
+    t = (button_text or "").strip().lower()
+
+    if not t:
+        if row == 0 and col == 0:
+            return f"/code {email}"
+
+        if row == 0 and col == 1:
+            return f"/link {email}"
+
+        if row == 0 and col == 2:
+            return f"/pwlink {email}"
+
+    if "เข้าสู่ระบบ" in t or "โค้ด" in t or "signin" in t or "code" in t:
+        return f"/code {email}"
+
+    if "ครัวเรือน" in t or "household" in t or "link" in t:
+        return f"/link {email}"
+
+    if "รีเซ็ต" in t or "รีเซ็ตรหัสผ่าน" in t or "reset" in t or "pwlink" in t:
+        return f"/pwlink {email}"
+
+    return None
+
+
+async def wait_for_buttons_or_result(bot, after_id, email, request_id: str = ""):
     start_time = asyncio.get_event_loop().time()
     fallback_button_msg = None
     fallback_result = None
@@ -253,22 +446,26 @@ async def wait_for_buttons_or_result(bot, after_id, email, request_id=""):
 
         if now - start_time > TIMEOUT_SECONDS:
             if fallback_result:
+                logging.info(f"[{request_id}] timeout but fallback result exists")
                 return fallback_result
 
             if fallback_button_msg:
+                logging.info(f"[{request_id}] timeout but fallback button exists")
                 return build_button_response(fallback_button_msg)
 
-            return fail("ระบบยังไม่พบข้อมูลในรอบนี้ กรุณาลองใหม่อีกครั้ง")
+            return fail("บอทไม่ส่งข้อมูลกลับมา")
 
         if fallback_result and fallback_found_time:
             if now - fallback_found_time >= FALLBACK_GRACE_SECONDS:
+                logging.info(f"[{request_id}] using fallback result after grace")
                 return fallback_result
 
         if fallback_button_msg and fallback_found_time:
             if now - fallback_found_time >= FALLBACK_GRACE_SECONDS:
+                logging.info(f"[{request_id}] using fallback button after grace")
                 return build_button_response(fallback_button_msg)
 
-        messages = await client.get_messages(bot, limit=MESSAGE_FETCH_LIMIT)
+        messages = await client.get_messages(bot, limit=30)
         new_messages = [m for m in messages if m.id > after_id]
         new_messages.sort(key=lambda x: x.id)
 
@@ -293,10 +490,10 @@ async def wait_for_buttons_or_result(bot, after_id, email, request_id=""):
                     fallback_result = result
                     fallback_found_time = now
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(1)
 
 
-async def wait_for_normal_result(bot, after_id, selected_button, email, request_id=""):
+async def wait_for_normal_result(bot, after_id, selected_button, email, request_id: str = ""):
     start_time = asyncio.get_event_loop().time()
     fallback_result = None
     fallback_found_time = None
@@ -306,15 +503,17 @@ async def wait_for_normal_result(bot, after_id, selected_button, email, request_
 
         if now - start_time > TIMEOUT_SECONDS:
             if fallback_result:
+                logging.info(f"[{request_id}] normal timeout but fallback result exists")
                 return fallback_result
 
-            return fail("ระบบใช้เวลานานเกินไป กรุณาลองใหม่อีกครั้ง")
+            return fail("บอท Maker ไม่ส่งข้อมูลกลับมา")
 
         if fallback_result and fallback_found_time:
             if now - fallback_found_time >= FALLBACK_GRACE_SECONDS:
+                logging.info(f"[{request_id}] normal using fallback result after grace")
                 return fallback_result
 
-        messages = await client.get_messages(bot, limit=MESSAGE_FETCH_LIMIT)
+        messages = await client.get_messages(bot, limit=30)
         new_messages = [m for m in messages if m.id > after_id]
         new_messages.sort(key=lambda x: x.id)
 
@@ -333,10 +532,10 @@ async def wait_for_normal_result(bot, after_id, selected_button, email, request_
                 fallback_result = result
                 fallback_found_time = now
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(1)
 
 
-async def wait_for_faulty_result(bot, after_id, selected_button, email, request_id=""):
+async def wait_for_faulty_result(bot, after_id, selected_button, email, request_id: str = ""):
     start_time = asyncio.get_event_loop().time()
     fallback_result = None
     fallback_found_time = None
@@ -346,15 +545,17 @@ async def wait_for_faulty_result(bot, after_id, selected_button, email, request_
 
         if now - start_time > TIMEOUT_SECONDS:
             if fallback_result:
+                logging.info(f"[{request_id}] special timeout but fallback result exists")
                 return fallback_result
 
-            return fail("ระบบยังไม่พบโค้ดหรือลิงก์ในรอบนี้ กรุณาลองใหม่อีกครั้ง")
+            return fail("บอทไม่ส่งข้อมูลกลับมา")
 
         if fallback_result and fallback_found_time:
             if now - fallback_found_time >= FALLBACK_GRACE_SECONDS:
+                logging.info(f"[{request_id}] special using fallback result after grace")
                 return fallback_result
 
-        messages = await client.get_messages(bot, limit=MESSAGE_FETCH_LIMIT)
+        messages = await client.get_messages(bot, limit=30)
         new_messages = [m for m in messages if m.id > after_id]
         new_messages.sort(key=lambda x: x.id)
 
@@ -373,116 +574,41 @@ async def wait_for_faulty_result(bot, after_id, selected_button, email, request_
                 fallback_result = result
                 fallback_found_time = now
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(1)
 
 
-async def find_button_message(bot, message_id=0, email=""):
-    if message_id:
-        try:
-            msg = await client.get_messages(bot, ids=message_id)
-
-            if msg and getattr(msg, "buttons", None):
-                return msg
-        except Exception:
-            pass
-
-    messages = await client.get_messages(bot, limit=MESSAGE_FETCH_LIMIT)
-
-    email_lower = email.lower().strip()
-    fallback_msg = None
-
-    for msg in messages:
-        if not getattr(msg, "buttons", None):
-            continue
-
-        text = (msg.message or "").lower()
-
-        if email_lower and email_lower in text:
-            return msg
-
-        if fallback_msg is None:
-            fallback_msg = msg
-
-    return fallback_msg
+def build_button_response(msg):
+    return {
+        "success": False,
+        "needButton": True,
+        "message": "กรุณาเลือกสิ่งที่ต้องการ",
+        "buttons": extract_buttons(msg),
+        "messageId": msg.id
+    }
 
 
-async def click_target_button(msg, row=0, col=0, button_text=""):
-    button_text = clean_text(button_text).lower()
-
-    if button_text:
-        for row_index, button_row in enumerate(msg.buttons or []):
-            for col_index, button in enumerate(button_row):
-                current_text = clean_text(button.text).lower()
-
-                if (
-                    current_text == button_text
-                    or button_text in current_text
-                    or current_text in button_text
-                ):
-                    await msg.click(row_index, col_index)
-                    return True
-
-    try:
-        await msg.click(row, col)
-        return True
-    except Exception:
+def is_retryable_fail(result):
+    if not isinstance(result, dict):
         return False
 
+    if result.get("success") is True:
+        return False
 
-def extract_faulty_result(msg, selected_button):
-    text = msg.message or ""
+    if result.get("needButton") is True:
+        return False
 
-    otp_match = re.search(r"OTP Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
-    if otp_match:
-        return success_code(otp_match.group(1), selected_button, text)
+    message = (result.get("message") or "").lower()
 
-    code_match = re.search(r"\b([0-9]{4,8})\b", text)
-    if code_match and looks_like_code_message(text):
-        return success_code(code_match.group(1), selected_button, text)
+    retry_keywords = [
+        "ไม่ส่งข้อมูล",
+        "ไม่ส่งปุ่ม",
+        "ไม่พบปุ่ม",
+        "ไม่พบข้อมูล",
+        "timeout",
+        "timed out"
+    ]
 
-    hidden_urls = extract_hidden_urls_from_message(msg)
-    if hidden_urls:
-        return success_link(hidden_urls[-1], selected_button, text)
-
-    link_match = re.search(r"Link:\s*(https?://[^\s]+)", text, re.IGNORECASE)
-    if link_match:
-        return success_link(link_match.group(1), selected_button, text)
-
-    raw_link_match = re.search(r"(https?://[^\s]+)", text, re.IGNORECASE)
-    if raw_link_match:
-        return success_link(raw_link_match.group(1), selected_button, text)
-
-    return None
-
-
-def extract_normal_code_or_link(msg, selected_button):
-    text = msg.message or ""
-
-    code_match = re.search(r"Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
-    if code_match:
-        return success_code(code_match.group(1), selected_button, text)
-
-    otp_match = re.search(r"OTP Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
-    if otp_match:
-        return success_code(otp_match.group(1), selected_button, text)
-
-    any_code_match = re.search(r"\b([0-9]{4,8})\b", text)
-    if any_code_match and looks_like_code_message(text):
-        return success_code(any_code_match.group(1), selected_button, text)
-
-    hidden_urls = extract_hidden_urls_from_message(msg)
-    if hidden_urls:
-        return success_link(hidden_urls[-1], selected_button, text)
-
-    link_match = re.search(r"Link:\s*(https?://[^\s]+)", text, re.IGNORECASE)
-    if link_match:
-        return success_link(link_match.group(1), selected_button, text)
-
-    raw_link_match = re.search(r"(https?://[^\s]+)", text, re.IGNORECASE)
-    if raw_link_match:
-        return success_link(raw_link_match.group(1), selected_button, text)
-
-    return None
+    return any(keyword.lower() in message for keyword in retry_keywords)
 
 
 def extract_hidden_urls_from_message(msg):
@@ -504,6 +630,7 @@ def extract_hidden_urls_from_message(msg):
 
                 if raw_url:
                     urls.append(raw_url)
+
             except Exception:
                 pass
 
@@ -518,65 +645,148 @@ def extract_hidden_urls_from_message(msg):
     unique_urls = []
     seen = set()
 
-    for url in urls:
-        if url and url not in seen:
-            seen.add(url)
-            unique_urls.append(url)
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
 
     return unique_urls
 
 
-def build_faulty_command(button_text, email, row=0, col=0):
-    t = clean_text(button_text).lower()
+def extract_faulty_result(msg, selected_button):
+    text = msg.message or ""
 
-    if not t:
-        if row == 0 and col == 0:
-            return f"/code {email}"
-        if row == 0 and col == 1:
-            return f"/link {email}"
-        if row == 0 and col == 2:
-            return f"/pwlink {email}"
+    otp_match = re.search(r"OTP Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
 
-    if "เข้าสู่ระบบ" in t or "โค้ด" in t or "signin" in t or "code" in t:
-        return f"/code {email}"
+    if otp_match:
+        return {
+            "success": True,
+            "type": "code",
+            "title": selected_button or "ขอโค้ดเข้าสู่ระบบ",
+            "value": otp_match.group(1),
+            "message": text
+        }
 
-    if "ครัวเรือน" in t or "household" in t or "link" in t:
-        return f"/link {email}"
+    code_match = re.search(r"\b([0-9]{4,8})\b", text)
 
-    if "รีเซ็ต" in t or "รีเซ็ตรหัสผ่าน" in t or "reset" in t or "pwlink" in t:
-        return f"/pwlink {email}"
+    if code_match and looks_like_code_message(text):
+        return {
+            "success": True,
+            "type": "code",
+            "title": selected_button or "ขอโค้ดเข้าสู่ระบบ",
+            "value": code_match.group(1),
+            "message": text
+        }
+
+    hidden_urls = extract_hidden_urls_from_message(msg)
+
+    if hidden_urls:
+        return {
+            "success": True,
+            "type": "link",
+            "title": selected_button or "ลิงก์",
+            "value": hidden_urls[-1],
+            "message": text
+        }
+
+    link_match = re.search(r"Link:\s*(https?://[^\s]+)", text, re.IGNORECASE)
+
+    if link_match:
+        return {
+            "success": True,
+            "type": "link",
+            "title": selected_button or "ลิงก์",
+            "value": link_match.group(1),
+            "message": text
+        }
+
+    raw_link_match = re.search(r"(https?://[^\s]+)", text, re.IGNORECASE)
+
+    if raw_link_match:
+        return {
+            "success": True,
+            "type": "link",
+            "title": selected_button or "ลิงก์",
+            "value": raw_link_match.group(1),
+            "message": text
+        }
 
     return None
 
 
-def is_special_button_action(button_text, row=0, col=0, message_id=0):
-    t = clean_text(button_text).lower()
+def extract_normal_code_or_link(msg, selected_button):
+    text = msg.message or ""
 
-    special_keywords = [
-        "ขอโค้ดเข้าสู่ระบบ",
-        "โค้ด",
-        "เข้าสู่ระบบ",
-        "ยืนยันครัวเรือน",
-        "ครัวเรือน",
-        "ลิงก์รีเซ็ตรหัสผ่าน",
-        "รีเซ็ต",
-        "reset",
-        "code",
-        "signin",
-        "household",
-        "pwlink"
-    ]
+    code_match = re.search(r"Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
 
-    if any(keyword in t for keyword in special_keywords):
-        return True
+    if code_match:
+        return {
+            "success": True,
+            "type": "code",
+            "title": selected_button or "ขอโค้ดเข้าสู่ระบบ",
+            "value": code_match.group(1),
+            "message": text
+        }
 
-    if message_id == 0 and row == 0 and col in [0, 1, 2]:
-        return True
+    otp_match = re.search(r"OTP Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
 
-    return False
+    if otp_match:
+        return {
+            "success": True,
+            "type": "code",
+            "title": selected_button or "ขอโค้ดเข้าสู่ระบบ",
+            "value": otp_match.group(1),
+            "message": text
+        }
+
+    any_code_match = re.search(r"\b([0-9]{4,8})\b", text)
+
+    if any_code_match and looks_like_code_message(text):
+        return {
+            "success": True,
+            "type": "code",
+            "title": selected_button or "ขอโค้ดเข้าสู่ระบบ",
+            "value": any_code_match.group(1),
+            "message": text
+        }
+
+    hidden_urls = extract_hidden_urls_from_message(msg)
+
+    if hidden_urls:
+        return {
+            "success": True,
+            "type": "link",
+            "title": selected_button or "ลิงก์",
+            "value": hidden_urls[-1],
+            "message": text
+        }
+
+    link_match = re.search(r"Link:\s*(https?://[^\s]+)", text, re.IGNORECASE)
+
+    if link_match:
+        return {
+            "success": True,
+            "type": "link",
+            "title": selected_button or "ลิงก์",
+            "value": link_match.group(1),
+            "message": text
+        }
+
+    raw_link_match = re.search(r"(https?://[^\s]+)", text, re.IGNORECASE)
+
+    if raw_link_match:
+        return {
+            "success": True,
+            "type": "link",
+            "title": selected_button or "ลิงก์",
+            "value": raw_link_match.group(1),
+            "message": text
+        }
+
+    return None
 
 
-def looks_like_code_message(text):
+def looks_like_code_message(text: str) -> bool:
     t = (text or "").lower()
 
     keywords = [
@@ -596,32 +806,6 @@ def looks_like_code_message(text):
     return any(keyword in t for keyword in keywords)
 
 
-def normalize_bot_username(bot_username):
-    bot_username = clean_text(bot_username).lower()
-
-    if not bot_username:
-        return ""
-
-    if not bot_username.startswith("@"):
-        bot_username = "@" + bot_username
-
-    return bot_username
-
-
-def should_use_special_bot(bot_username):
-    return normalize_bot_username(bot_username) == SPECIAL_BOT
-
-
-def build_button_response(msg):
-    return {
-        "success": False,
-        "needButton": True,
-        "message": "กรุณาเลือกเมนูที่ต้องการ",
-        "buttons": extract_buttons(msg),
-        "messageId": msg.id
-    }
-
-
 def extract_buttons(message):
     buttons = []
 
@@ -636,54 +820,7 @@ def extract_buttons(message):
     return buttons
 
 
-def success_code(value, title, message):
-    return {
-        "success": True,
-        "type": "code",
-        "title": title or "โค้ดของคุณ",
-        "value": value,
-        "message": message
-    }
-
-
-def success_link(value, title, message):
-    return {
-        "success": True,
-        "type": "link",
-        "title": title or "ลิงก์ของคุณ",
-        "value": value,
-        "message": message
-    }
-
-
-def fail(message, request_id=""):
-    result = {
-        "success": False,
-        "message": message
-    }
-
-    if request_id:
-        result["requestId"] = request_id
-
-    return result
-
-
-def attach_request_id(result, request_id):
-    if isinstance(result, dict):
-        result.setdefault("requestId", request_id)
-
-    return result
-
-
-def make_request_id():
-    return uuid.uuid4().hex[:10]
-
-
-def clean_text(value):
-    return str(value or "").strip()
-
-
-def mask_email(email):
+def mask_email(email: str) -> str:
     email = email or ""
 
     if "@" not in email:
@@ -697,3 +834,24 @@ def mask_email(email):
         masked_name = name[:2] + "***"
 
     return masked_name + "@" + domain
+
+
+def mask_command(command_text: str) -> str:
+    parts = (command_text or "").split()
+
+    if len(parts) >= 2:
+        return parts[0] + " " + mask_email(parts[1])
+
+    return command_text or ""
+
+
+def fail(message, request_id: str = ""):
+    result = {
+        "success": False,
+        "message": message
+    }
+
+    if request_id:
+        result["requestId"] = request_id
+
+    return result
