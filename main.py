@@ -9,8 +9,6 @@ API_HASH = os.getenv("TG_API_HASH", "")
 TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "")
 
 TIMEOUT_SECONDS = 60
-OTP_PATTERN = r"\b\d{4,8}\b"
-URL_PATTERN = r"https?://[^\s]+"
 
 app = FastAPI()
 client = TelegramClient(StringSession(TG_STRING_SESSION), API_ID, API_HASH)
@@ -27,6 +25,7 @@ class ButtonRequest(BaseModel):
     botUsername: str
     row: int
     col: int
+    buttonText: str = ""
 
 
 @app.on_event("startup")
@@ -58,7 +57,7 @@ async def get_otp(data: OtpRequest):
 
             await client.send_message(bot, email)
 
-            return await wait_for_new_reply(bot, before_id)
+            return await wait_for_buttons_only(bot, before_id)
 
         except Exception as e:
             return fail(str(e))
@@ -79,8 +78,8 @@ async def click_button(data: ButtonRequest):
             before_id = await get_latest_message_id(bot)
 
             messages = await client.get_messages(bot, limit=10)
-            target_msg = None
 
+            target_msg = None
             for msg in messages:
                 if msg.buttons:
                     target_msg = msg
@@ -91,7 +90,7 @@ async def click_button(data: ButtonRequest):
 
             await target_msg.click(data.row, data.col)
 
-            return await wait_for_new_reply(bot, before_id)
+            return await wait_for_result(bot, before_id, data.buttonText)
 
         except Exception as e:
             return fail(str(e))
@@ -102,12 +101,35 @@ async def get_latest_message_id(bot):
     return messages[0].id if messages else 0
 
 
-async def wait_for_new_reply(bot, before_id):
+async def wait_for_buttons_only(bot, before_id):
     start_time = asyncio.get_event_loop().time()
 
     while True:
         if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
-            return fail("บอท Maker ไม่ตอบกลับภายในเวลาที่กำหนด")
+            return fail("บอท Maker ไม่ส่งปุ่มกลับมา")
+
+        messages = await client.get_messages(bot, limit=10)
+        new_messages = [m for m in messages if m.id > before_id]
+        new_messages.sort(key=lambda x: x.id)
+
+        for msg in new_messages:
+            if msg.buttons:
+                return {
+                    "success": False,
+                    "needButton": True,
+                    "message": "กรุณาเลือกสิ่งที่ต้องการ",
+                    "buttons": extract_buttons(msg)
+                }
+
+        await asyncio.sleep(2)
+
+
+async def wait_for_result(bot, before_id, selected_button):
+    start_time = asyncio.get_event_loop().time()
+
+    while True:
+        if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
+            return fail("บอท Maker ไม่ส่งข้อมูลกลับมา")
 
         messages = await client.get_messages(bot, limit=10)
         new_messages = [m for m in messages if m.id > before_id]
@@ -115,49 +137,34 @@ async def wait_for_new_reply(bot, before_id):
 
         for msg in new_messages:
             text = msg.message or ""
+            result = extract_code_or_link(text, selected_button)
 
-            if msg.buttons:
-                return {
-                    "success": False,
-                    "needButton": True,
-                    "message": "กรุณาเลือกบริการที่ต้องการ",
-                    "buttons": extract_buttons(msg)
-                }
-
-            result = extract_result(text)
             if result:
                 return result
 
         await asyncio.sleep(2)
 
 
-def extract_result(text):
-    urls = re.findall(URL_PATTERN, text)
-    otps = re.findall(OTP_PATTERN, text)
+def extract_code_or_link(text, selected_button):
+    code_match = re.search(r"Code:\s*([0-9]{4,8})", text, re.IGNORECASE)
+    link_match = re.search(r"Link:\s*(https?://[^\s]+)", text, re.IGNORECASE)
 
-    if urls:
+    if code_match:
+        return {
+            "success": True,
+            "type": "code",
+            "title": selected_button or "ขอโค้ดเข้าสู่ระบบ",
+            "value": code_match.group(1),
+            "message": text
+        }
+
+    if link_match:
         return {
             "success": True,
             "type": "link",
-            "value": urls[-1],
+            "title": selected_button or "ลิงก์",
+            "value": link_match.group(1),
             "message": text
-        }
-
-    if otps:
-        return {
-            "success": True,
-            "type": "otp",
-            "otp": otps[-1],
-            "value": otps[-1],
-            "message": text
-        }
-
-    if text.strip():
-        return {
-            "success": True,
-            "type": "text",
-            "value": text.strip(),
-            "message": text.strip()
         }
 
     return None
