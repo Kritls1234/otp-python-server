@@ -12,6 +12,7 @@ API_HASH = os.getenv("TG_API_HASH", "")
 TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "")
 
 TIMEOUT_SECONDS = 60
+MAX_RETRY = 1
 SPECIAL_BOT = "@faultyhhbot"
 
 app = FastAPI()
@@ -75,11 +76,8 @@ async def get_otp(data: OtpRequest):
                 "specialMode": True
             }
 
-        sent_msg = await client.send_message(bot, email)
-
-        return await wait_for_buttons_or_result(
+        return await run_normal_get_otp_with_retry(
             bot=bot,
-            after_id=sent_msg.id,
             email=email
         )
 
@@ -109,11 +107,9 @@ async def click_button(data: ButtonRequest):
             if not command_text:
                 return fail("ไม่รู้จักคำสั่งที่เลือก")
 
-            sent_msg = await client.send_message(bot, command_text)
-
-            return await wait_for_faulty_result(
+            return await run_special_command_with_retry(
                 bot=bot,
-                after_id=sent_msg.id,
+                command_text=command_text,
                 selected_button=button_text,
                 email=email
             )
@@ -127,25 +123,140 @@ async def click_button(data: ButtonRequest):
         if not target_msg:
             return fail("ไม่พบปุ่มจากบอท กรุณาขอโค้ดใหม่อีกครั้ง")
 
-        clicked = await click_target_button(
-            msg=target_msg,
+        return await run_normal_click_with_retry(
+            bot=bot,
+            target_msg=target_msg,
             row=data.row,
             col=data.col,
-            button_text=button_text
-        )
-
-        if not clicked:
-            return fail("กดปุ่มไม่สำเร็จ กรุณาตรวจ row/col หรือชื่อปุ่ม")
-
-        return await wait_for_normal_result(
-            bot=bot,
-            after_id=target_msg.id,
-            selected_button=button_text,
+            button_text=button_text,
             email=email
         )
 
     except Exception as e:
         return fail(str(e))
+
+
+async def run_normal_get_otp_with_retry(bot, email):
+    last_result = None
+
+    for attempt in range(MAX_RETRY + 1):
+        sent_msg = await client.send_message(bot, email)
+
+        result = await wait_for_buttons_or_result(
+            bot=bot,
+            after_id=sent_msg.id,
+            email=email
+        )
+
+        if not is_retryable_fail(result):
+            return result
+
+        last_result = result
+
+        if attempt < MAX_RETRY:
+            await asyncio.sleep(2)
+
+    return last_result or fail("บอทไม่ส่งข้อมูลกลับมา")
+
+
+async def run_special_command_with_retry(bot, command_text, selected_button, email):
+    last_result = None
+
+    for attempt in range(MAX_RETRY + 1):
+        sent_msg = await client.send_message(bot, command_text)
+
+        result = await wait_for_faulty_result(
+            bot=bot,
+            after_id=sent_msg.id,
+            selected_button=selected_button,
+            email=email
+        )
+
+        if not is_retryable_fail(result):
+            return result
+
+        last_result = result
+
+        if attempt < MAX_RETRY:
+            await asyncio.sleep(2)
+
+    return last_result or fail("บอทไม่ส่งข้อมูลกลับมา")
+
+
+async def run_normal_click_with_retry(bot, target_msg, row, col, button_text, email):
+    last_result = None
+
+    for attempt in range(MAX_RETRY + 1):
+        if attempt == 0:
+            clicked = await click_target_button(
+                msg=target_msg,
+                row=row,
+                col=col,
+                button_text=button_text
+            )
+
+            if not clicked:
+                return fail("กดปุ่มไม่สำเร็จ กรุณาตรวจ row/col หรือชื่อปุ่ม")
+
+            after_id = target_msg.id
+
+        else:
+            sent_msg = await client.send_message(bot, email)
+
+            button_result = await wait_for_buttons_or_result(
+                bot=bot,
+                after_id=sent_msg.id,
+                email=email
+            )
+
+            if button_result.get("success") is True:
+                return button_result
+
+            if not button_result.get("needButton"):
+                last_result = button_result
+                continue
+
+            retry_message_id = button_result.get("messageId", 0)
+
+            retry_msg = await find_button_message(
+                bot=bot,
+                message_id=retry_message_id,
+                email=email
+            )
+
+            if not retry_msg:
+                last_result = fail("ไม่พบปุ่มจากบอทหลัง retry")
+                continue
+
+            clicked = await click_target_button(
+                msg=retry_msg,
+                row=row,
+                col=col,
+                button_text=button_text
+            )
+
+            if not clicked:
+                last_result = fail("กดปุ่มหลัง retry ไม่สำเร็จ")
+                continue
+
+            after_id = retry_msg.id
+
+        result = await wait_for_normal_result(
+            bot=bot,
+            after_id=after_id,
+            selected_button=button_text,
+            email=email
+        )
+
+        if not is_retryable_fail(result):
+            return result
+
+        last_result = result
+
+        if attempt < MAX_RETRY:
+            await asyncio.sleep(2)
+
+    return last_result or fail("บอท Maker ไม่ส่งข้อมูลกลับมา")
 
 
 async def find_button_message(bot, message_id: int = 0, email: str = ""):
@@ -324,6 +435,30 @@ def build_button_response(msg):
         "buttons": extract_buttons(msg),
         "messageId": msg.id
     }
+
+
+def is_retryable_fail(result):
+    if not isinstance(result, dict):
+        return False
+
+    if result.get("success") is True:
+        return False
+
+    if result.get("needButton") is True:
+        return False
+
+    message = (result.get("message") or "").lower()
+
+    retry_keywords = [
+        "ไม่ส่งข้อมูล",
+        "ไม่ส่งปุ่ม",
+        "ไม่พบปุ่ม",
+        "ไม่พบข้อมูล",
+        "timeout",
+        "timed out"
+    ]
+
+    return any(keyword.lower() in message for keyword in retry_keywords)
 
 
 def extract_hidden_urls_from_message(msg):
