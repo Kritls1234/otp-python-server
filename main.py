@@ -1,6 +1,4 @@
-import os
-import re
-import asyncio
+import os, re, asyncio
 from fastapi import FastAPI
 from pydantic import BaseModel
 from telethon import TelegramClient
@@ -10,8 +8,9 @@ API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
 TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "")
 
-OTP_PATTERN = r"\b\d{4,8}\b"
 TIMEOUT_SECONDS = 60
+OTP_PATTERN = r"\b\d{4,8}\b"
+URL_PATTERN = r"https?://[^\s]+"
 
 app = FastAPI()
 client = TelegramClient(StringSession(TG_STRING_SESSION), API_ID, API_HASH)
@@ -47,54 +46,39 @@ async def get_otp(data: OtpRequest):
         bot_username = data.botUsername.strip()
 
         if not email:
-            return {"success": False, "message": "ไม่มีอีเมล"}
-
+            return fail("ไม่มีอีเมล")
         if not bot_username:
-            return {"success": False, "message": "ไม่มี BotUsername"}
-
+            return fail("ไม่มี BotUsername")
         if not await client.is_user_authorized():
-            return {
-                "success": False,
-                "message": "Telegram ยังไม่ได้ล็อกอิน ต้องใส่ TG_STRING_SESSION ก่อน"
-            }
+            return fail("Telegram ยังไม่ได้ล็อกอิน")
 
         try:
             bot = await client.get_entity(bot_username)
+            before_id = await get_latest_message_id(bot)
 
             await client.send_message(bot, email)
-            await asyncio.sleep(2)
 
-            result = await wait_for_otp_or_buttons(bot)
-
-            return result
+            return await wait_for_new_reply(bot, before_id)
 
         except Exception as e:
-            return {"success": False, "message": str(e)}
+            return fail(str(e))
 
 
 @app.post("/click-button")
 async def click_button(data: ButtonRequest):
     async with lock:
-        email = data.email.strip()
         bot_username = data.botUsername.strip()
 
-        if not email:
-            return {"success": False, "message": "ไม่มีอีเมล"}
-
         if not bot_username:
-            return {"success": False, "message": "ไม่มี BotUsername"}
-
+            return fail("ไม่มี BotUsername")
         if not await client.is_user_authorized():
-            return {
-                "success": False,
-                "message": "Telegram ยังไม่ได้ล็อกอิน ต้องใส่ TG_STRING_SESSION ก่อน"
-            }
+            return fail("Telegram ยังไม่ได้ล็อกอิน")
 
         try:
             bot = await client.get_entity(bot_username)
+            before_id = await get_latest_message_id(bot)
 
-            messages = await client.get_messages(bot, limit=5)
-
+            messages = await client.get_messages(bot, limit=10)
             target_msg = None
 
             for msg in messages:
@@ -103,78 +87,86 @@ async def click_button(data: ButtonRequest):
                     break
 
             if not target_msg:
-                return {
-                    "success": False,
-                    "message": "ไม่พบปุ่มจากบอท"
-                }
+                return fail("ไม่พบปุ่มจากบอท")
 
             await target_msg.click(data.row, data.col)
-            await asyncio.sleep(2)
 
-            result = await wait_for_otp_or_buttons(bot)
-
-            return result
+            return await wait_for_new_reply(bot, before_id)
 
         except Exception as e:
-            return {"success": False, "message": str(e)}
+            return fail(str(e))
 
 
-async def wait_for_otp_or_buttons(bot):
+async def get_latest_message_id(bot):
+    messages = await client.get_messages(bot, limit=1)
+    return messages[0].id if messages else 0
+
+
+async def wait_for_new_reply(bot, before_id):
     start_time = asyncio.get_event_loop().time()
-    clicked_auto = False
 
     while True:
         if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
-            return {
-                "success": False,
-                "message": "บอท Maker ไม่ตอบกลับภายในเวลาที่กำหนด"
-            }
+            return fail("บอท Maker ไม่ตอบกลับภายในเวลาที่กำหนด")
 
-        messages = await client.get_messages(bot, limit=5)
+        messages = await client.get_messages(bot, limit=10)
+        new_messages = [m for m in messages if m.id > before_id]
+        new_messages.sort(key=lambda x: x.id)
 
-        for msg in messages:
+        for msg in new_messages:
             text = msg.message or ""
 
-            otp = find_otp(text)
-            if otp:
-                return {
-                    "success": True,
-                    "otp": otp,
-                    "message": "ดึง OTP สำเร็จ"
-                }
-
             if msg.buttons:
-                buttons = extract_buttons(msg)
-
-                if not clicked_auto:
-                    auto_clicked = await click_otp_button(msg)
-                    if auto_clicked:
-                        clicked_auto = True
-                        await asyncio.sleep(3)
-                        break
-
                 return {
                     "success": False,
                     "needButton": True,
-                    "message": "กรุณาเลือกปุ่มที่ต้องการ",
-                    "buttons": buttons
+                    "message": "กรุณาเลือกบริการที่ต้องการ",
+                    "buttons": extract_buttons(msg)
                 }
+
+            result = extract_result(text)
+            if result:
+                return result
 
         await asyncio.sleep(2)
 
 
-def find_otp(text: str):
-    match = re.search(OTP_PATTERN, text)
-    return match.group(0) if match else None
+def extract_result(text):
+    urls = re.findall(URL_PATTERN, text)
+    otps = re.findall(OTP_PATTERN, text)
+
+    if urls:
+        return {
+            "success": True,
+            "type": "link",
+            "value": urls[-1],
+            "message": text
+        }
+
+    if otps:
+        return {
+            "success": True,
+            "type": "otp",
+            "otp": otps[-1],
+            "value": otps[-1],
+            "message": text
+        }
+
+    if text.strip():
+        return {
+            "success": True,
+            "type": "text",
+            "value": text.strip(),
+            "message": text.strip()
+        }
+
+    return None
 
 
 def extract_buttons(message):
-    if not message.buttons:
-        return []
-
     buttons = []
 
-    for row_index, row in enumerate(message.buttons):
+    for row_index, row in enumerate(message.buttons or []):
         for col_index, button in enumerate(row):
             buttons.append({
                 "text": button.text or "",
@@ -185,26 +177,8 @@ def extract_buttons(message):
     return buttons
 
 
-async def click_otp_button(message):
-    keywords = [
-        "otp",
-        "OTP",
-        "code",
-        "Code",
-        "ขอ",
-        "รหัส",
-        "รับรหัส",
-        "ขอรหัส",
-        "login",
-        "Login"
-    ]
-
-    for row_index, row in enumerate(message.buttons):
-        for col_index, button in enumerate(row):
-            button_text = button.text or ""
-
-            if any(k in button_text for k in keywords):
-                await message.click(row_index, col_index)
-                return True
-
-    return False
+def fail(message):
+    return {
+        "success": False,
+        "message": message
+    }
