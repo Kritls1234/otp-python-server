@@ -160,6 +160,39 @@ async def health() -> Dict[str, Any]:
         return {"success": False, "status": "error", "message": sanitize_error(exc), "requestId": request_id}
 
 
+@app.get("/bhagatflix-debug")
+async def bhagatflix_debug(email: str = "", action: str = "code") -> Dict[str, Any]:
+    """Debug endpoint - ทดสอบ bhagatflix flow โดยตรง"""
+    if not BHAGATFLIX_EMAIL or not BHAGATFLIX_PASSWORD:
+        return {"step": "config", "ok": False, "error": "Missing BHAGATFLIX_EMAIL or BHAGATFLIX_PASSWORD env vars"}
+
+    # Step 1: Login Supabase
+    token_data = await get_bhagatflix_token()
+    if not token_data or not token_data.get("access_token"):
+        return {"step": "login", "ok": False, "error": "Supabase login failed - check email/password"}
+
+    result = {
+        "step": "login",
+        "ok": True,
+        "tokenPreview": token_data["access_token"][:30] + "...",
+        "hasRefresh": bool(token_data.get("refresh_token")),
+    }
+
+    if not email:
+        return result
+
+    # Step 2: Call API
+    if action not in BHAGATFLIX_ENDPOINTS:
+        action = "code"
+    api_result = await call_bhagatflix_api(action, email)
+    result["step"] = "api"
+    result["apiOk"] = api_result.get("ok")
+    result["apiStatus"] = api_result.get("status")
+    result["apiData"] = api_result.get("data")
+
+    return result
+
+
 @app.post("/get-otp")
 async def get_otp(data: OtpRequest) -> Dict[str, Any]:
     request_id = make_request_id()
