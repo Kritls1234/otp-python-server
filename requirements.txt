@@ -1,5 +1,6 @@
 fastapi
-uvicorn
-telethon
-python-dotenv
+uvicorn[standard]
 pydantic
+telethon
+httpx
+gunicorn
