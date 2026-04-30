@@ -1,14 +1,17 @@
 import os
 import re
+import json
 import uuid
 import html
 import time
 import asyncio
 import logging
+import urllib.parse
 from contextlib import asynccontextmanager
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, AsyncGenerator, Set
 
+import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 from telethon import TelegramClient, events
@@ -19,39 +22,48 @@ from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 # =========================
 # ENV CONFIG
 # =========================
-
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
 TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "")
 
 TIMEOUT_SECONDS = float(os.getenv("TIMEOUT_SECONDS", "35"))
 SEMAPHORE_LIMIT = int(os.getenv("SEMAPHORE_LIMIT", "15"))
-
-# fallback polling ยังเก็บไว้ เผื่อ event ไม่ยิงในบางจังหวะ
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.22"))
 MESSAGE_LIMIT = int(os.getenv("MESSAGE_LIMIT", "18"))
 
-# ถ้า true = บอทเดียวกันจะส่งคำสั่งทีละงาน ปลอดภัยกว่าแต่ช้ากว่า
-# ถ้า false = ส่งพร้อมกันได้เร็วกว่า
 SAFE_SAME_BOT_QUEUE = os.getenv("SAFE_SAME_BOT_QUEUE", "false").lower() == "true"
-
-# ถ้าบอทตอบกลับไม่มีอีเมลในข้อความ และมีคนใช้พร้อมกัน อาจมีความเสี่ยงสลับ
-# true = ยอมรับผลลัพธ์ที่ match ตามประเภทปุ่มได้ แม้ไม่มี email ในข้อความ
 ALLOW_UNMATCHED_CONCURRENT = os.getenv("ALLOW_UNMATCHED_CONCURRENT", "true").lower() == "true"
-
-# เปิด event listener เป็นหลัก
 USE_EVENT_LISTENER = os.getenv("USE_EVENT_LISTENER", "true").lower() == "true"
-
-# ใช้ fallback polling ควบคู่กับ event listener
 USE_POLLING_FALLBACK = os.getenv("USE_POLLING_FALLBACK", "true").lower() == "true"
 
 SPECIAL_BOT = "@faultyhhbot"
+
+# ---- Bhagatflix (Magic Window) config ----
+BHAGATFLIX_BOT = "@bhagatflix"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://arjzgyadqemequykgvcz.supabase.co")
+SUPABASE_ANON_KEY = os.getenv(
+    "SUPABASE_ANON_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFyanpneWFkcWVtZXF1eWtndmN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTI1MDUzNDIsImV4cCI6MjA2ODA4MTM0Mn0.72VjrbubOyq0rtGjRAwjixfRtAQQFUJHKpxI6wnh1Tk"
+)
+SUPABASE_PROJECT_ID = os.getenv("SUPABASE_PROJECT_ID", "arjzgyadqemequykgvcz")
+BHAGATFLIX_EMAIL = os.getenv("BHAGATFLIX_EMAIL", "")
+BHAGATFLIX_PASSWORD = os.getenv("BHAGATFLIX_PASSWORD", "")
+BHAGATFLIX_BASE = os.getenv("BHAGATFLIX_BASE", "https://www.bhagatflix.com")
+
+BHAGATFLIX_ENDPOINTS = {
+    "code": "/api/signin-code",
+    "household": "/api/household-code",
+    "reset": "/api/reset-link",
+}
+
+# token cache (Supabase)
+_bhagat_token_cache: Dict[str, Any] = {"access_token": None, "refresh_token": None, "expires_at": 0}
+_bhagat_token_lock = asyncio.Lock()
 
 
 # =========================
 # APP / CLIENT
 # =========================
-
 app = FastAPI(title="OTP Python Server Final")
 
 client = TelegramClient(
@@ -61,12 +73,10 @@ client = TelegramClient(
 )
 
 semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
-
 entity_cache: Dict[str, Any] = {}
 bot_locks: Dict[str, asyncio.Lock] = {}
 active_by_bot: Dict[str, int] = defaultdict(int)
 
-# pending request registry สำหรับ event-based listener
 pending_requests: Dict[str, Dict[str, Any]] = {}
 pending_lock = asyncio.Lock()
 
@@ -74,14 +84,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-
 logger = logging.getLogger("otp-server-final")
 
 
 # =========================
 # MODELS
 # =========================
-
 class OtpRequest(BaseModel):
     email: str
     botUsername: str
@@ -99,38 +107,45 @@ class ButtonRequest(BaseModel):
 # =========================
 # STARTUP / SHUTDOWN
 # =========================
-
 @app.on_event("startup")
 async def startup() -> None:
     if not API_ID or not API_HASH or not TG_STRING_SESSION:
         logger.warning("Missing required Telegram environment variables")
-
-    await client.connect()
+    try:
+        await client.connect()
+    except Exception:
+        logger.exception("telegram connect failed")
 
     if USE_EVENT_LISTENER:
-        register_event_listener()
+        try:
+            register_event_listener()
+        except Exception:
+            logger.exception("event listener register failed")
 
     logger.info(
-        "server startup complete use_event=%s fallback_polling=%s semaphore=%s timeout=%s poll=%s limit=%s queue=%s",
+        "server startup complete use_event=%s fallback_polling=%s semaphore=%s timeout=%s poll=%s limit=%s queue=%s bhagatflix_email_set=%s",
         USE_EVENT_LISTENER,
         USE_POLLING_FALLBACK,
         SEMAPHORE_LIMIT,
         TIMEOUT_SECONDS,
         POLL_INTERVAL,
         MESSAGE_LIMIT,
-        SAFE_SAME_BOT_QUEUE
+        SAFE_SAME_BOT_QUEUE,
+        bool(BHAGATFLIX_EMAIL and BHAGATFLIX_PASSWORD)
     )
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    await client.disconnect()
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
 
 
 # =========================
 # ROUTES
 # =========================
-
 @app.get("/")
 async def home() -> Dict[str, Any]:
     return {
@@ -143,13 +158,9 @@ async def home() -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     request_id = make_request_id()
-
     try:
-        await ensure_client_ready()
-
         connected = client.is_connected()
         authorized = await client.is_user_authorized() if connected else False
-
         return {
             "success": True,
             "status": "ok" if connected and authorized else "not_ready",
@@ -157,12 +168,11 @@ async def health() -> Dict[str, Any]:
             "authorized": authorized,
             "mode": "event-listener" if USE_EVENT_LISTENER else "polling",
             "pendingRequests": len(pending_requests),
+            "bhagatflixReady": bool(BHAGATFLIX_EMAIL and BHAGATFLIX_PASSWORD),
             "requestId": request_id
         }
-
     except Exception as exc:
         logger.exception("health failed requestId=%s", request_id)
-
         return {
             "success": False,
             "status": "error",
@@ -186,13 +196,28 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
 
     if not email:
         return fail("กรุณากรอกอีเมล", request_id)
-
     if not bot_username:
         return fail("กรุณาเลือกระบบ", request_id)
-
     if not is_valid_email(email):
         return fail("รูปแบบอีเมลไม่ถูกต้อง", request_id)
 
+    # ---- Bhagatflix (Magic Window) ----
+    if is_bhagatflix(bot_username):
+        return {
+            "success": False,
+            "needButton": True,
+            "message": "กรุณาเลือกเมนูที่ต้องการ",
+            "buttons": [
+                {"text": "ขอโค้ดเข้าสู่ระบบ", "row": 0, "col": 0},
+                {"text": "ยืนยันครัวเรือน", "row": 0, "col": 1},
+                {"text": "ลิงก์รีเซ็ตรหัสผ่าน", "row": 0, "col": 2}
+            ],
+            "messageId": 0,
+            "specialMode": True,
+            "requestId": request_id
+        }
+
+    # ---- Telegram flow ----
     async with semaphore:
         async with active_bot_request(bot_username):
             try:
@@ -236,7 +261,6 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
                     result.get("success"),
                     result.get("needButton")
                 )
-
                 return result
 
             except Exception as exc:
@@ -245,7 +269,6 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
                     request_id,
                     mask_email(email)
                 )
-
                 return fail(sanitize_error(exc), request_id)
 
 
@@ -268,13 +291,22 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
 
     if not email:
         return fail("กรุณากรอกอีเมล", request_id)
-
     if not bot_username:
         return fail("กรุณาเลือกระบบ", request_id)
-
     if not is_valid_email(email):
         return fail("รูปแบบอีเมลไม่ถูกต้อง", request_id)
 
+    # ---- Bhagatflix (Magic Window) ----
+    if is_bhagatflix(bot_username):
+        return await handle_bhagatflix_click(
+            email=email,
+            row=data.row,
+            col=data.col,
+            button_text=button_text,
+            request_id=request_id
+        )
+
+    # ---- Telegram flow ----
     async with semaphore:
         async with active_bot_request(bot_username):
             try:
@@ -312,7 +344,6 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                         mask_email(email),
                         result.get("success")
                     )
-
                     return result
 
                 target_msg = await find_button_message(
@@ -351,7 +382,6 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                     mask_email(email),
                     result.get("success")
                 )
-
                 return result
 
             except Exception as exc:
@@ -360,25 +390,322 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                     request_id,
                     mask_email(email)
                 )
-
                 return fail(sanitize_error(exc), request_id)
+
+
+# =========================
+# BHAGATFLIX (Magic Window)
+# =========================
+def is_bhagatflix(bot_username: str) -> bool:
+    return normalize_bot_username(bot_username) == BHAGATFLIX_BOT
+
+
+def bhagatflix_action_from_position(row: int, col: int, button_text: str) -> Optional[str]:
+    text = clean_text(button_text).lower()
+    if text:
+        if is_code_choice(text):
+            return "code"
+        if is_household_choice(text):
+            return "household"
+        if is_reset_choice(text):
+            return "reset"
+    if row == 0 and col == 0:
+        return "code"
+    if row == 0 and col == 1:
+        return "household"
+    if row == 0 and col == 2:
+        return "reset"
+    return None
+
+
+def bhagatflix_title(action: str) -> str:
+    return {
+        "code": "ขอโค้ดเข้าสู่ระบบ",
+        "household": "ยืนยันครัวเรือน",
+        "reset": "ลิงก์รีเซ็ตรหัสผ่าน",
+    }.get(action, "ข้อมูล")
+
+
+async def get_bhagatflix_token() -> Optional[Dict[str, Any]]:
+    """Login Supabase + cache token จนกว่าจะหมดอายุ"""
+    if not BHAGATFLIX_EMAIL or not BHAGATFLIX_PASSWORD:
+        return None
+
+    async with _bhagat_token_lock:
+        now = time.time()
+        cached = _bhagat_token_cache
+        if cached.get("access_token") and cached.get("expires_at", 0) > now + 30:
+            return cached
+
+        url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
+        headers = {
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_ANON_KEY,
+            "Origin": BHAGATFLIX_BASE,
+            "Referer": BHAGATFLIX_BASE + "/",
+        }
+        payload = {
+            "email": BHAGATFLIX_EMAIL,
+            "password": BHAGATFLIX_PASSWORD,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                resp = await http.post(url, json=payload, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("bhagatflix supabase login failed status=%s", resp.status_code)
+                return None
+            data = resp.json()
+            expires_in = int(data.get("expires_in") or 3600)
+            cached.update({
+                "access_token": data.get("access_token"),
+                "refresh_token": data.get("refresh_token"),
+                "expires_at": now + expires_in,
+                "user": data.get("user"),
+                "expires_in": expires_in,
+                "token_type": data.get("token_type", "bearer"),
+            })
+            return cached
+        except Exception:
+            logger.exception("bhagatflix supabase login error")
+            return None
+
+
+def build_bhagatflix_cookies(token_data: Dict[str, Any]) -> Dict[str, str]:
+    cookie_obj = {
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token"),
+        "expires_in": token_data.get("expires_in", 3600),
+        "expires_at": int(token_data.get("expires_at", 0)),
+        "token_type": token_data.get("token_type", "bearer"),
+        "user": token_data.get("user"),
+    }
+    cookie_json = json.dumps(cookie_obj, separators=(",", ":"))
+    cookie_encoded = urllib.parse.quote(cookie_json, safe="")
+
+    cookies = {f"sb-{SUPABASE_PROJECT_ID}-auth-token": cookie_encoded}
+
+    chunk_size = 3000
+    if len(cookie_encoded) > chunk_size:
+        chunks = [cookie_encoded[i:i + chunk_size] for i in range(0, len(cookie_encoded), chunk_size)]
+        for i, chunk in enumerate(chunks):
+            cookies[f"sb-{SUPABASE_PROJECT_ID}-auth-token.{i}"] = chunk
+
+    return cookies
+
+
+async def call_bhagatflix_api(action: str, customer_email: str) -> Dict[str, Any]:
+    """ยิง API ของ bhagatflix ด้วย session ของ admin"""
+    endpoint = BHAGATFLIX_ENDPOINTS.get(action)
+    if not endpoint:
+        return {"ok": False, "error": "unknown action"}
+
+    token_data = await get_bhagatflix_token()
+    if not token_data or not token_data.get("access_token"):
+        return {"ok": False, "error": "auth failed"}
+
+    url = f"{BHAGATFLIX_BASE}{endpoint}"
+    cookies = build_bhagatflix_cookies(token_data)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token_data['access_token']}",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Origin": BHAGATFLIX_BASE,
+        "Referer": BHAGATFLIX_BASE + "/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    payload = {"email": customer_email}
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.post(url, json=payload, headers=headers, cookies=cookies)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text[:500]}
+        return {"ok": resp.status_code == 200, "status": resp.status_code, "data": data}
+    except Exception as exc:
+        logger.exception("bhagatflix api error")
+        return {"ok": False, "error": str(exc)}
+
+
+def parse_bhagatflix_response(action: str, raw: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+    """แปลง response เป็น format เดียวกับ Telegram bot"""
+    title = bhagatflix_title(action)
+
+    if not raw.get("ok"):
+        msg = "ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง"
+        data = raw.get("data") or {}
+        if isinstance(data, dict):
+            err = data.get("error") or data.get("message")
+            if err:
+                err_lower = str(err).lower()
+                if "not authenticated" in err_lower or "unauthorized" in err_lower:
+                    msg = "ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล"
+        return fail(msg, request_id)
+
+    data = raw.get("data") or {}
+
+    # API ส่ง emails array กลับมา
+    emails = data.get("emails") if isinstance(data, dict) else None
+    if isinstance(emails, list) and emails:
+        first = emails[0] or {}
+        html_body = first.get("html") or first.get("body") or ""
+
+        if action == "reset":
+            link = extract_netflix_link(html_body)
+            if link:
+                return {
+                    "success": True,
+                    "type": "link",
+                    "title": title,
+                    "value": link,
+                    "message": first.get("subject") or title,
+                    "requestId": request_id
+                }
+        else:
+            code = extract_netflix_code(html_body)
+            if code:
+                return {
+                    "success": True,
+                    "type": "code",
+                    "title": title,
+                    "value": code,
+                    "message": first.get("subject") or title,
+                    "requestId": request_id
+                }
+
+        # fallback: regex หา code/link แบบทั่วไป
+        plain = re.sub(r"<[^>]+>", " ", html_body)
+        plain = html.unescape(plain)
+        if action == "reset":
+            url_match = re.search(r"https?://[^\s\"'<>]+", html_body)
+            if url_match:
+                return {
+                    "success": True,
+                    "type": "link",
+                    "title": title,
+                    "value": url_match.group(0).rstrip(".,;)]}"),
+                    "message": title,
+                    "requestId": request_id
+                }
+        else:
+            code_match = re.search(r"(?<!\d)([0-9]{4})(?!\d)", plain)
+            if code_match:
+                return {
+                    "success": True,
+                    "type": "code",
+                    "title": title,
+                    "value": code_match.group(1),
+                    "message": title,
+                    "requestId": request_id
+                }
+
+    # บางทีตอบกลับมาตรงๆ
+    if isinstance(data, dict):
+        for key in ("code", "otp", "signin_code", "household_code", "token"):
+            if data.get(key):
+                return {
+                    "success": True,
+                    "type": "code",
+                    "title": title,
+                    "value": str(data[key]),
+                    "message": title,
+                    "requestId": request_id
+                }
+        for key in ("link", "reset_link", "url", "reset_url"):
+            if data.get(key):
+                return {
+                    "success": True,
+                    "type": "link",
+                    "title": title,
+                    "value": str(data[key]),
+                    "message": title,
+                    "requestId": request_id
+                }
+
+    return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
+
+
+def extract_netflix_code(html_body: str) -> Optional[str]:
+    """ดึงโค้ด Netflix จาก HTML — ใช้ logic เดียวกับฝั่ง Telegram"""
+    if not html_body:
+        return None
+    text = re.sub(r"<style[^>]*>[\s\S]*?</style>", " ", html_body, flags=re.IGNORECASE)
+    text = re.sub(r"<script[^>]*>[\s\S]*?</script>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # หา keyword ภาษาไทย/อังกฤษก่อน แล้วค่อยจับเลข 4 หลัก
+    keyword_patterns = [
+        r"ป้อนรหัสนี้เพื่อเข้าสู่ระบบ\s*([0-9]{4,8})",
+        r"ป้อนรหัส[^0-9]{0,40}([0-9]{4,8})",
+        r"เพื่อเข้าใช้งาน[^0-9]{0,40}([0-9]{4,8})",
+        r"รหัสยืนยัน[^0-9]{0,40}([0-9]{4,8})",
+        r"sign[\s-]*in\s*code[^0-9]{0,40}([0-9]{4,8})",
+        r"verification\s*code[^0-9]{0,40}([0-9]{4,8})",
+        r"travel\s*verify\s*code[^0-9]{0,40}([0-9]{4,8})",
+        r"household\s*code[^0-9]{0,40}([0-9]{4,8})",
+        r"enter\s*this\s*code[^0-9]{0,40}([0-9]{4,8})",
+    ]
+    for pattern in keyword_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    # fallback: เลข 4 หลัก
+    match = re.search(r"(?<!\d)([0-9]{4})(?!\d)", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def extract_netflix_link(html_body: str) -> Optional[str]:
+    """ดึง reset link ของ Netflix จาก HTML"""
+    if not html_body:
+        return None
+    patterns = [
+        r"href=[\"']([^\"']*(?:netflix|nflxext)[^\"']*reset[^\"']*)[\"']",
+        r"href=[\"']([^\"']*reset[^\"']*(?:netflix|nflxext)[^\"']*)[\"']",
+        r"href=[\"']([^\"']*(?:netflix|nflxext)[^\"']*)[\"']",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_body, re.IGNORECASE)
+        if match:
+            return match.group(1).rstrip(".,;)]}")
+    match = re.search(r"https?://[^\s\"'<>]+", html_body)
+    if match:
+        return match.group(0).rstrip(".,;)]}")
+    return None
+
+
+async def handle_bhagatflix_click(
+    email: str,
+    row: int,
+    col: int,
+    button_text: str,
+    request_id: str
+) -> Dict[str, Any]:
+    action = bhagatflix_action_from_position(row, col, button_text)
+    if not action:
+        return fail("ไม่รู้จักเมนูที่เลือก กรุณาลองใหม่อีกครั้ง", request_id)
+
+    raw = await call_bhagatflix_api(action, email)
+    return parse_bhagatflix_response(action, raw, request_id)
 
 
 # =========================
 # EVENT LISTENER
 # =========================
-
 def register_event_listener() -> None:
     @client.on(events.NewMessage(incoming=True))
     async def on_new_message(event: Any) -> None:
         try:
             msg = event.message
-
             if not msg:
                 return
-
             await dispatch_incoming_message(msg)
-
         except Exception:
             logger.exception("event listener failed")
 
@@ -389,8 +716,6 @@ async def dispatch_incoming_message(msg: Any) -> None:
             return
 
         matched_keys: List[str] = []
-
-        # copy กัน dict เปลี่ยนระหว่าง loop
         items = list(pending_requests.items())
 
         for key, pending in items:
@@ -398,17 +723,18 @@ async def dispatch_incoming_message(msg: Any) -> None:
                 continue
 
             after_id = int(pending.get("after_id") or 0)
-
             if msg.id <= after_id:
                 continue
 
             target_id = pending.get("target_id")
-
             if target_id is not None:
                 try:
-                    chat_id = getattr(msg.peer_id, "channel_id", None) or getattr(msg.peer_id, "user_id", None) or getattr(msg.peer_id, "chat_id", None)
+                    chat_id = (
+                        getattr(msg.peer_id, "channel_id", None)
+                        or getattr(msg.peer_id, "user_id", None)
+                        or getattr(msg.peer_id, "chat_id", None)
+                    )
                     if chat_id is not None and str(chat_id) != str(target_id):
-                        # บาง entity id format ไม่ตรง ใช้ข้ามเฉพาะถ้าแน่ใจ
                         pass
                 except Exception:
                     pass
@@ -436,7 +762,6 @@ async def dispatch_incoming_message(msg: Any) -> None:
                 continue
 
             future: asyncio.Future = pending["future"]
-
             if not future.done():
                 future.set_result(result)
                 pending["done"] = True
@@ -467,7 +792,6 @@ async def wait_for_buttons_or_result(
             expect_buttons=expect_buttons,
             special_mode=special_mode
         )
-
         if result:
             return result
 
@@ -496,7 +820,6 @@ async def wait_with_event_listener(
     loop = asyncio.get_event_loop()
     future: asyncio.Future = loop.create_future()
     pending_key = request_id
-
     target_id = get_entity_identity(target)
 
     async with pending_lock:
@@ -515,7 +838,6 @@ async def wait_with_event_listener(
         }
 
     polling_task: Optional[asyncio.Task] = None
-
     if USE_POLLING_FALLBACK:
         polling_task = asyncio.create_task(
             polling_fallback_to_future(
@@ -534,14 +856,11 @@ async def wait_with_event_listener(
     try:
         result = await asyncio.wait_for(future, timeout=TIMEOUT_SECONDS)
         return result
-
     except asyncio.TimeoutError:
         return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
-
     finally:
         async with pending_lock:
             pending_requests.pop(pending_key, None)
-
         if polling_task and not polling_task.done():
             polling_task.cancel()
 
@@ -559,13 +878,11 @@ async def polling_fallback_to_future(
 ) -> None:
     try:
         start_time = asyncio.get_event_loop().time()
-
         while True:
             if future.done():
                 return
 
             elapsed = asyncio.get_event_loop().time() - start_time
-
             if elapsed > TIMEOUT_SECONDS:
                 return
 
@@ -601,10 +918,8 @@ async def polling_fallback_to_future(
                 return
 
             await asyncio.sleep(POLL_INTERVAL)
-
     except asyncio.CancelledError:
         return
-
     except Exception:
         logger.exception("polling fallback failed requestId=%s", request_id)
 
@@ -623,7 +938,6 @@ async def wait_with_polling(
 
     while True:
         elapsed = asyncio.get_event_loop().time() - start_time
-
         if elapsed > TIMEOUT_SECONDS:
             return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
 
@@ -675,7 +989,6 @@ def build_result_from_message(
         }
 
     no_data = extract_no_data_message(msg.message or "")
-
     if no_data:
         return fail(no_data, request_id)
 
@@ -696,24 +1009,20 @@ async def get_new_messages(target: Any, after_id: int) -> List[Any]:
 # =========================
 # TELEGRAM HELPERS
 # =========================
-
 async def ensure_client_ready() -> None:
     if not client.is_connected():
         await client.connect()
-
     if not await client.is_user_authorized():
         raise RuntimeError("ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล")
 
 
 async def get_cached_entity(bot_username: str) -> Any:
     key = normalize_bot_username(bot_username)
-
     if key in entity_cache:
         return entity_cache[key]
 
     entity = await client.get_entity(key)
     entity_cache[key] = entity
-
     return entity
 
 
@@ -724,7 +1033,6 @@ def get_entity_identity(entity: Any) -> Optional[str]:
             return str(entity_id)
     except Exception:
         pass
-
     return None
 
 
@@ -732,7 +1040,6 @@ def get_entity_identity(entity: Any) -> Optional[str]:
 async def active_bot_request(bot_username: str) -> AsyncGenerator[None, None]:
     key = normalize_bot_username(bot_username)
     active_by_bot[key] += 1
-
     try:
         yield
     finally:
@@ -742,7 +1049,6 @@ async def active_bot_request(bot_username: str) -> AsyncGenerator[None, None]:
 @asynccontextmanager
 async def optional_bot_lock(bot_username: str) -> AsyncGenerator[None, None]:
     key = normalize_bot_username(bot_username)
-
     if not SAFE_SAME_BOT_QUEUE:
         yield
         return
@@ -762,26 +1068,21 @@ async def find_button_message(
     if message_id:
         try:
             msg = await client.get_messages(target, ids=message_id)
-
             if msg and getattr(msg, "buttons", None):
                 return msg
         except Exception:
             pass
 
     messages = await client.get_messages(target, limit=MESSAGE_LIMIT)
-
     email_lower = clean_email(email)
     fallback_msg = None
 
     for msg in messages:
         if not getattr(msg, "buttons", None):
             continue
-
         text = clean_text(msg.message).lower()
-
         if email_lower and email_lower in text:
             return msg
-
         if fallback_msg is None:
             fallback_msg = msg
 
@@ -795,13 +1096,11 @@ async def click_target_button(
     button_text: str = ""
 ) -> bool:
     button_text = clean_text(button_text).lower()
-
     try:
         if button_text:
             for row_index, button_row in enumerate(msg.buttons or []):
                 for col_index, button in enumerate(button_row):
                     current_text = clean_text(getattr(button, "text", "")).lower()
-
                     if (
                         current_text == button_text
                         or button_text in current_text
@@ -809,10 +1108,8 @@ async def click_target_button(
                     ):
                         await msg.click(row_index, col_index)
                         return True
-
         await msg.click(row, col)
         return True
-
     except Exception:
         return False
 
@@ -820,7 +1117,6 @@ async def click_target_button(
 # =========================
 # MATCHING / EXTRACTION
 # =========================
-
 def is_relevant_message(
     msg: Any,
     bot_username: str,
@@ -834,27 +1130,22 @@ def is_relevant_message(
     bot_key = normalize_bot_username(bot_username)
     active_count = active_by_bot.get(bot_key, 0)
 
-    # ดีที่สุด: ข้อความมี email ตรงกับ request
     if email_lower and email_lower in text_lower:
         return True
 
     selected_lower = clean_text(selected_button).lower()
 
-    # ถ้าเป็นข้อความไม่พบข้อมูล และมี email ในข้อความเท่านั้นจะชัวร์สุด
     no_data = extract_no_data_message(text)
     if no_data and email_lower and email_lower in text_lower:
         return True
 
-    # ถ้ามี request เดียวในบอทนี้ ยอมรับได้
     if active_count <= 1:
         return True
 
-    # กรณีพร้อมกันหลาย request ให้พยายาม match จากประเภทเมนู
     if selected_lower:
         if is_reset_choice(selected_lower):
             if "reset" in text_lower or "password" in text_lower or extract_urls_from_message(msg):
                 return ALLOW_UNMATCHED_CONCURRENT
-
         if is_household_choice(selected_lower):
             if (
                 "travel verify" in text_lower
@@ -863,7 +1154,6 @@ def is_relevant_message(
                 or "verify" in text_lower
             ):
                 return ALLOW_UNMATCHED_CONCURRENT
-
         if is_code_choice(selected_lower):
             if looks_like_code_message(text_lower):
                 return ALLOW_UNMATCHED_CONCURRENT
@@ -882,7 +1172,6 @@ def extract_code_or_link(
     text = html.unescape(msg.message or "")
 
     code = extract_code(text)
-
     if code:
         return {
             "success": True,
@@ -894,14 +1183,12 @@ def extract_code_or_link(
         }
 
     urls = extract_urls_from_message(msg)
-
     if urls:
         selected_url = select_url_for_result(
             urls=urls,
             text=text,
             selected_button=selected_button
         )
-
         return {
             "success": True,
             "type": "link",
@@ -927,7 +1214,6 @@ def extract_code(text: str) -> Optional[str]:
 
     for pattern in specific_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
-
         if match:
             code = extract_first_4_digit_code(match.group(1))
             if code:
@@ -947,12 +1233,10 @@ def extract_code(text: str) -> Optional[str]:
 
     for pattern in label_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
-
         if match:
             code_4 = extract_first_4_digit_code(match.group(1))
             if code_4:
                 return code_4
-
             code_any = extract_first_4_to_8_digit_code(match.group(1))
             if code_any:
                 return code_any
@@ -961,7 +1245,6 @@ def extract_code(text: str) -> Optional[str]:
         code_4 = extract_first_4_digit_code(text)
         if code_4:
             return code_4
-
         code_any = extract_first_4_to_8_digit_code(text)
         if code_any:
             return code_any
@@ -972,24 +1255,18 @@ def extract_code(text: str) -> Optional[str]:
 def extract_first_4_digit_code(text: str) -> Optional[str]:
     if not text:
         return None
-
     match = re.search(r"(?<!\d)([0-9]{4})(?!\d)", text)
-
     if match:
         return match.group(1)
-
     return None
 
 
 def extract_first_4_to_8_digit_code(text: str) -> Optional[str]:
     if not text:
         return None
-
     match = re.search(r"(?<!\d)([0-9]{4,8})(?!\d)", text)
-
     if match:
         return match.group(1)
-
     return None
 
 
@@ -1010,7 +1287,6 @@ def extract_no_data_message(text: str) -> Optional[str]:
 
     if any(pattern in value for pattern in no_data_patterns):
         return "ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง"
-
     return None
 
 
@@ -1023,23 +1299,19 @@ def extract_urls_from_message(msg: Any) -> List[str]:
     for entity in entities:
         if isinstance(entity, MessageEntityTextUrl):
             url = getattr(entity, "url", None)
-
             if url:
                 urls.append(url)
-
         elif isinstance(entity, MessageEntityUrl):
             try:
                 start = entity.offset
                 end = entity.offset + entity.length
                 raw_url = text[start:end]
-
                 if raw_url:
                     urls.append(raw_url)
             except Exception:
                 pass
 
     raw_url_matches = re.findall(r"https?://[^\s<>\]\)\"']+", text, re.IGNORECASE)
-
     for url in raw_url_matches:
         urls.append(url)
 
@@ -1047,7 +1319,6 @@ def extract_urls_from_message(msg: Any) -> List[str]:
         for row in msg.buttons:
             for button in row:
                 url = getattr(button, "url", None)
-
                 if url:
                     urls.append(url)
 
@@ -1081,40 +1352,22 @@ def select_url_for_result(
 
 def detect_title_from_text(text: str) -> str:
     value = clean_text(text).lower()
-
     if "travel verify code" in value or "household" in value or "ครัวเรือน" in value:
         return "ยืนยันครัวเรือน"
-
     if "sign-in code" in value or "signin code" in value or "sign in code" in value:
         return "ขอโค้ดเข้าสู่ระบบ"
-
     if "password reset" in value or "reset link" in value:
         return "ลิงก์รีเซ็ตรหัสผ่าน"
-
     return "ข้อมูลล่าสุด"
 
 
 def looks_like_code_message(text: str) -> bool:
     value = clean_text(text).lower()
-
     keywords = [
-        "code",
-        "otp",
-        "verification",
-        "verify",
-        "login",
-        "signin",
-        "sign in",
-        "sign-in",
-        "travel verify",
-        "netflix sign-in code",
-        "netflix travel verify code",
-        "เข้าสู่ระบบ",
-        "รหัส",
-        "โค้ด",
-        "ยืนยัน"
+        "code", "otp", "verification", "verify", "login", "signin", "sign in",
+        "sign-in", "travel verify", "netflix sign-in code", "netflix travel verify code",
+        "เข้าสู่ระบบ", "รหัส", "โค้ด", "ยืนยัน"
     ]
-
     return any(keyword in value for keyword in keywords)
 
 
@@ -1133,9 +1386,8 @@ def extract_buttons(message: Any) -> List[Dict[str, Any]]:
 
 
 # =========================
-# SPECIAL BOT
+# SPECIAL BOT (faultyhhbot)
 # =========================
-
 def build_special_command(
     button_text: str,
     email: str,
@@ -1147,19 +1399,15 @@ def build_special_command(
     if not text:
         if row == 0 and col == 0:
             return f"/code {email}"
-
         if row == 0 and col == 1:
             return f"/link {email}"
-
         if row == 0 and col == 2:
             return f"/pwlink {email}"
 
     if is_code_choice(text):
         return f"/code {email}"
-
     if is_household_choice(text):
         return f"/link {email}"
-
     if is_reset_choice(text):
         return f"/pwlink {email}"
 
@@ -1169,19 +1417,15 @@ def build_special_command(
 def special_title_from_position(row: int, col: int) -> str:
     if row == 0 and col == 0:
         return "ขอโค้ดเข้าสู่ระบบ"
-
     if row == 0 and col == 1:
         return "ยืนยันครัวเรือน"
-
     if row == 0 and col == 2:
         return "ลิงก์รีเซ็ตรหัสผ่าน"
-
     return "ข้อมูล"
 
 
 def is_code_choice(text: str) -> bool:
     value = clean_text(text).lower()
-
     return (
         "เข้าสู่ระบบ" in value
         or "โค้ด" in value
@@ -1194,7 +1438,6 @@ def is_code_choice(text: str) -> bool:
 
 def is_household_choice(text: str) -> bool:
     value = clean_text(text).lower()
-
     return (
         "ครัวเรือน" in value
         or "household" in value
@@ -1205,7 +1448,6 @@ def is_household_choice(text: str) -> bool:
 
 def is_reset_choice(text: str) -> bool:
     value = clean_text(text).lower()
-
     return (
         "รีเซ็ต" in value
         or "รีเซ็ตรหัสผ่าน" in value
@@ -1217,13 +1459,10 @@ def is_reset_choice(text: str) -> bool:
 
 def normalize_bot_username(bot_username: Any) -> str:
     value = clean_text(bot_username).lower()
-
     if not value:
         return ""
-
     if not value.startswith("@"):
         value = "@" + value
-
     return value
 
 
@@ -1234,7 +1473,6 @@ def should_use_special_bot(bot_username: str) -> bool:
 # =========================
 # UTILS
 # =========================
-
 def is_valid_email(email: str) -> bool:
     return bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email))
 
@@ -1245,17 +1483,13 @@ def make_request_id() -> str:
 
 def mask_email(email: str) -> str:
     email = clean_email(email)
-
     if "@" not in email:
         return "***"
-
     name, domain = email.split("@", 1)
-
     if len(name) <= 2:
         masked_name = name[0:1] + "***"
     else:
         masked_name = name[:2] + "***" + name[-1:]
-
     return masked_name + "@" + domain
 
 
@@ -1274,12 +1508,10 @@ def clean_url(url: str) -> str:
 def unique_list(items: Any) -> List[str]:
     seen: Set[str] = set()
     result: List[str] = []
-
     for item in items:
         if item and item not in seen:
             seen.add(item)
             result.append(item)
-
     return result
 
 
@@ -1296,14 +1528,15 @@ def sanitize_error(error: Any) -> str:
         (r"api_id", "ระบบ"),
         (r"api_hash", "ระบบ"),
         (r"traceback", "ระบบ"),
-        (r"exception", "ระบบ")
+        (r"exception", "ระบบ"),
+        (r"supabase", "ระบบ"),
+        (r"bhagatflix", "ระบบ"),
     ]
 
     for pattern, repl in replacements:
         raw = re.sub(pattern, repl, raw, flags=re.IGNORECASE)
 
     no_data = extract_no_data_message(raw)
-
     if no_data:
         return no_data
 
