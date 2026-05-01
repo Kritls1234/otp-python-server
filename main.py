@@ -476,46 +476,44 @@ def parse_bhagatflix_response(action: str, raw: Dict[str, Any], request_id: str,
         first = emails[0] or {}
         html_body = first.get("html") or first.get("body") or ""
         subject = first.get("subject") or title
+        from_addr = first.get("from") or first.get("sender") or ""
+        date_str = first.get("date") or first.get("received_at") or ""
 
-        if action == "reset":
-            link = extract_netflix_link(html_body)
-            if link:
-                return {
-                    "success": True, "type": "link", "title": title, "value": link,
-                    "message": subject, "subject": subject, "html": html_body,
-                    "email": customer_email, "magicWindow": True, "requestId": request_id
-                }
-        else:
-            code = extract_netflix_code(html_body)
-            if code:
-                return {
-                    "success": True, "type": "code", "title": title, "value": code,
-                    "message": subject, "subject": subject, "html": html_body,
-                    "email": customer_email, "magicWindow": True, "requestId": request_id
-                }
-
-        # fallback: เจอเมลแต่หา code/link ไม่เจอ ส่ง html ไปให้แสดงเอง
+        # bhagatflix flow: ส่ง HTML mailbox กลับเสมอ ให้ลูกค้าอ่านเอง
         return {
-            "success": True, "type": "email", "title": title, "value": "",
-            "message": subject, "subject": subject, "html": html_body,
-            "email": customer_email, "magicWindow": True, "requestId": request_id
+            "success": True,
+            "type": "email",
+            "title": title,
+            "value": "",
+            "message": subject,
+            "subject": subject,
+            "from": from_addr,
+            "date": date_str,
+            "html": html_body,
+            "email": customer_email,
+            "magicWindow": True,
+            "requestId": request_id
         }
 
     if isinstance(data, dict):
-        for key in ("code", "otp", "signin_code", "household_code", "token"):
-            if data.get(key):
-                return {
-                    "success": True, "type": "code", "title": title,
-                    "value": str(data[key]), "message": title,
-                    "email": customer_email, "magicWindow": True, "requestId": request_id
-                }
-        for key in ("link", "reset_link", "url", "reset_url"):
-            if data.get(key):
-                return {
-                    "success": True, "type": "link", "title": title,
-                    "value": str(data[key]), "message": title,
-                    "email": customer_email, "magicWindow": True, "requestId": request_id
-                }
+        # บางทีตอบมาเป็น object เดียว ไม่ใช่ array
+        html_single = data.get("html") or data.get("body") or ""
+        subject_single = data.get("subject") or title
+        if html_single:
+            return {
+                "success": True,
+                "type": "email",
+                "title": title,
+                "value": "",
+                "message": subject_single,
+                "subject": subject_single,
+                "from": data.get("from") or "",
+                "date": data.get("date") or "",
+                "html": html_single,
+                "email": customer_email,
+                "magicWindow": True,
+                "requestId": request_id
+            }
 
     return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
 
