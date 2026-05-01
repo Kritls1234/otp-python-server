@@ -318,11 +318,38 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                 if not clicked:
                     return fail("กดเมนูไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", request_id)
 
-                return await wait_for_buttons_or_result(
+                first_result = await wait_for_buttons_or_result(
                     target=target, bot_username=bot_username, after_id=target_msg.id,
                     email=email, selected_button=button_text,
                     request_id=request_id, expect_buttons=False, special_mode=False
                 )
+
+                # ถ้าได้ปุ่มซ้อนกลับมา → กดปุ่มแรกอัตโนมัติ
+                if first_result and first_result.get("needButton") and first_result.get("buttons"):
+                    nested_buttons = first_result.get("buttons") or []
+                    if nested_buttons:
+                        first_btn = nested_buttons[0]
+                        nested_msg_id = first_result.get("messageId") or 0
+                        nested_msg = await find_button_message(
+                            target=target, message_id=nested_msg_id, email=email
+                        )
+                        if nested_msg:
+                            ok = await click_target_button(
+                                msg=nested_msg,
+                                row=int(first_btn.get("row") or 0),
+                                col=int(first_btn.get("col") or 0),
+                                button_text=str(first_btn.get("text") or "")
+                            )
+                            if ok:
+                                return await wait_for_buttons_or_result(
+                                    target=target, bot_username=bot_username,
+                                    after_id=nested_msg.id, email=email,
+                                    selected_button=button_text,
+                                    request_id=request_id,
+                                    expect_buttons=False, special_mode=False
+                                )
+
+                return first_result
             except Exception as exc:
                 logger.exception("click_button error")
                 return fail(sanitize_error(exc), request_id)
@@ -902,7 +929,37 @@ def is_relevant_message(msg: Any, bot_username: str, email: str, selected_button
 
 def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Optional[Dict[str, Any]]:
     text = html.unescape(msg.message or "")
+    selected_lower = clean_text(selected_button).lower()
 
+    # ถ้าเป็นเมนู Reset Link → ตรวจ URL ก่อน (ห้ามดึง code/year)
+    is_reset_request = (
+        "reset" in selected_lower
+        or "รีเซ็ต" in selected_lower
+        or "pwlink" in selected_lower
+        or "password" in selected_lower
+        or "ลิงก์" in selected_lower
+    )
+
+    if is_reset_request:
+        urls = extract_urls_from_message(msg)
+        # หา URL ที่เป็นลิงก์รีเซ็ตจริงๆ (ไม่ใช่ลิงก์ทั่วไปใน footer)
+        reset_url = pick_reset_url(urls, text)
+        if reset_url:
+            return {
+                "success": True, "type": "link",
+                "title": selected_button or detect_title_from_text(text),
+                "value": reset_url, "message": text, "requestId": request_id
+            }
+        # ถ้ายังไม่เจอ ลอง URL อื่นๆ
+        if urls:
+            return {
+                "success": True, "type": "link",
+                "title": selected_button or detect_title_from_text(text),
+                "value": urls[0], "message": text, "requestId": request_id
+            }
+        return None
+
+    # กรณีเมนูอื่น (Sign-in / Household) → ตรวจ code ก่อน
     code = extract_code(text)
     if code:
         return {
@@ -919,6 +976,33 @@ def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Opt
             "title": selected_button or detect_title_from_text(text),
             "value": selected_url, "message": text, "requestId": request_id
         }
+
+    return None
+
+
+def pick_reset_url(urls: List[str], text: str) -> Optional[str]:
+    """เลือก URL ที่น่าจะเป็นลิงก์รีเซ็ตจริงๆ"""
+    if not urls:
+        return None
+
+    # priority 1: URL ที่มี keyword เกี่ยวกับ password/reset
+    priority_keywords = ["password", "reset", "nftoken", "lkid=url_cta", "/p/", "/account"]
+    for url in urls:
+        url_lower = url.lower()
+        for keyword in priority_keywords:
+            if keyword in url_lower:
+                return url
+
+    # priority 2: URL ของ netflix ที่ไม่ใช่ footer (settings, help, terms)
+    skip_keywords = ["help.netflix", "termsofuse", "privacypolicy", "notificationsettings",
+                     "url_terms", "url_privacy", "url_help", "url_corp_info", "url_logo",
+                     "url_email", "url_src", "url_comm_settings", "beaconimages"]
+    for url in urls:
+        url_lower = url.lower()
+        if any(skip in url_lower for skip in skip_keywords):
+            continue
+        if "netflix.com" in url_lower or "nflxext" in url_lower:
+            return url
 
     return None
 
