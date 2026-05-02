@@ -931,7 +931,6 @@ def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Opt
     text = html.unescape(msg.message or "")
     selected_lower = clean_text(selected_button).lower()
 
-    # ถ้าเป็นเมนู Reset Link → ตรวจ URL ก่อน (ห้ามดึง code/year)
     is_reset_request = (
         "reset" in selected_lower
         or "รีเซ็ต" in selected_lower
@@ -940,9 +939,16 @@ def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Opt
         or "ลิงก์" in selected_lower
     )
 
+    is_household_request = (
+        "ครัวเรือน" in selected_lower
+        or "household" in selected_lower
+        or "travel" in selected_lower
+        or "verify" in selected_lower
+    )
+
+    # ─── RESET LINK: ส่ง URL เท่านั้น ห้ามจับ code ─────
     if is_reset_request:
         urls = extract_urls_from_message(msg)
-        # หา URL ที่เป็นลิงก์รีเซ็ตจริงๆ (ไม่ใช่ลิงก์ทั่วไปใน footer)
         reset_url = pick_reset_url(urls, text)
         if reset_url:
             return {
@@ -950,7 +956,6 @@ def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Opt
                 "title": selected_button or detect_title_from_text(text),
                 "value": reset_url, "message": text, "requestId": request_id
             }
-        # ถ้ายังไม่เจอ ลอง URL อื่นๆ
         if urls:
             return {
                 "success": True, "type": "link",
@@ -959,7 +964,68 @@ def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Opt
             }
         return None
 
-    # กรณีเมนูอื่น (Sign-in / Household) → ตรวจ code ก่อน
+    # ─── HOUSEHOLD: ดู context ของ response เพื่อตัดสินใจ ─────
+    if is_household_request:
+        urls = extract_urls_from_message(msg)
+        text_lower = clean_text(text).lower()
+
+        # 1. หา URL ที่เป็นลิงก์ household (มี travel/verify/account/p/)
+        household_url = pick_household_url(urls, text)
+        if household_url:
+            return {
+                "success": True, "type": "link",
+                "title": selected_button or detect_title_from_text(text),
+                "value": household_url, "message": text, "requestId": request_id
+            }
+
+        # 2. ลองหา code ที่อยู่ใกล้ keyword household
+        household_code = extract_household_code(text)
+        if household_code:
+            return {
+                "success": True, "type": "code",
+                "title": selected_button or detect_title_from_text(text),
+                "value": household_code, "message": text, "requestId": request_id
+            }
+
+        # 3. ถ้า text มีคำใบ้ว่าเป็นลิงก์ → เอา URL ตัวแรกที่ valid
+        link_hints = ["click here", "verify here", "this link", "ลิงก์", "กดลิงก์", "คลิก"]
+        if urls and any(h in text_lower for h in link_hints):
+            return {
+                "success": True, "type": "link",
+                "title": selected_button or detect_title_from_text(text),
+                "value": urls[0], "message": text, "requestId": request_id
+            }
+
+        # 4. ถ้ามี url netflix/account ใดๆ → ใช้
+        if urls:
+            netflix_url = next((u for u in urls if "netflix" in u.lower() or "nflxext" in u.lower()), None)
+            if netflix_url and not is_footer_url(netflix_url):
+                return {
+                    "success": True, "type": "link",
+                    "title": selected_button or detect_title_from_text(text),
+                    "value": netflix_url, "message": text, "requestId": request_id
+                }
+
+        # 5. fallback: ดึง code 4-8 หลัก (กรณีบอทตอบสั้นๆ มีแค่เลข)
+        code = extract_code(text)
+        if code:
+            return {
+                "success": True, "type": "code",
+                "title": selected_button or detect_title_from_text(text),
+                "value": code, "message": text, "requestId": request_id
+            }
+
+        # 6. fallback สุด: เอา URL อะไรก็ได้
+        if urls:
+            return {
+                "success": True, "type": "link",
+                "title": selected_button or detect_title_from_text(text),
+                "value": urls[0], "message": text, "requestId": request_id
+            }
+
+        return None
+
+    # ─── SIGN-IN CODE / อื่นๆ: ดึง code ก่อน ─────
     code = extract_code(text)
     if code:
         return {
@@ -976,6 +1042,74 @@ def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Opt
             "title": selected_button or detect_title_from_text(text),
             "value": selected_url, "message": text, "requestId": request_id
         }
+
+    return None
+
+
+def is_footer_url(url: str) -> bool:
+    """URL ของ footer ที่ไม่ใช่ลิงก์ที่ลูกค้าต้องการ"""
+    skip = [
+        "help.netflix", "termsofuse", "privacypolicy", "notificationsettings",
+        "url_terms", "url_privacy", "url_help", "url_corp_info", "url_logo",
+        "url_email", "url_src", "url_comm_settings", "beaconimages"
+    ]
+    u = url.lower()
+    return any(s in u for s in skip)
+
+
+def pick_household_url(urls: List[str], text: str) -> Optional[str]:
+    """หา URL ของ Household จริงๆ"""
+    if not urls:
+        return None
+
+    # priority 1: URL ที่มี keyword household/travel/verify
+    priority_keywords = [
+        "travel", "verify", "household", "account/access",
+        "accountaccess", "lkid=url_cta", "/p/", "nftoken"
+    ]
+    for url in urls:
+        u = url.lower()
+        if is_footer_url(url):
+            continue
+        for keyword in priority_keywords:
+            if keyword in u:
+                return url
+
+    # priority 2: netflix URL ที่ไม่ใช่ footer
+    for url in urls:
+        u = url.lower()
+        if is_footer_url(url):
+            continue
+        if "netflix.com" in u or "nflxext" in u:
+            return url
+
+    return None
+
+
+def extract_household_code(text: str) -> Optional[str]:
+    """ดึงเฉพาะ code ของ Household (อยู่ใกล้ keyword)"""
+    if not text:
+        return None
+
+    cleaned = html.unescape(text)
+    patterns = [
+        r"travel\s*verify\s*code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
+        r"household\s*code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
+        r"Netflix\s*Travel\s*Verify\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
+        r"ยืนยัน\s*ครัวเรือน\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
+        r"รหัส\s*ยืนยัน\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
+        r"verification\s*code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)"
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, cleaned, re.IGNORECASE)
+        if m:
+            code_4 = extract_first_4_digit_code(m.group(1))
+            if code_4:
+                return code_4
+            code_any = extract_first_4_to_8_digit_code(m.group(1))
+            if code_any:
+                return code_any
 
     return None
 
