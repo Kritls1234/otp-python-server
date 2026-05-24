@@ -1,6 +1,7 @@
 """
-Yopmail HTML Reader + 2Captcha — Clean Content Only
-- ดึงเฉพาะเนื้อหาอีเมล ตัดปุ่ม Yopmail / FW header / Show pictures ออก
+Yopmail HTML Reader + 2Captcha - Smart Content Extraction
+- ดึงเฉพาะเนื้อหาอีเมลจริง ตัด Yopmail UI + FW header
+- หาเลข OTP โดยข้ามปี ค.ศ./พ.ศ. และเลขเบอร์โทร
 """
 import os, re, time, asyncio, logging, urllib.parse, html as html_mod
 from typing import Any, Dict, Optional
@@ -72,7 +73,7 @@ async def yopmail_startup():
             logger.exception("[yopmail] 2Captcha init failed")
             _solver = None
     else:
-        logger.warning("[yopmail] 2Captcha disabled (no API key or library)")
+        logger.warning("[yopmail] 2Captcha disabled")
     logger.info("[yopmail] ready")
 
 
@@ -83,17 +84,15 @@ async def yopmail_shutdown():
             await _browser.close()
         if _pw:
             await _pw.stop()
-    except Exception:
-        pass
+    except Exception: pass
 
 
 def _check_tok(t):
     return (not YOPMAIL_SESSION_TOKEN) or t == YOPMAIL_SESSION_TOKEN
 
 
-async def _solve_hcaptcha(sitekey: str, page_url: str) -> Optional[str]:
-    if not _solver:
-        return None
+async def _solve_hcaptcha(sitekey, page_url):
+    if not _solver: return None
     def _solve():
         try:
             return _solver.hcaptcha(sitekey=sitekey, url=page_url).get("code")
@@ -103,9 +102,8 @@ async def _solve_hcaptcha(sitekey: str, page_url: str) -> Optional[str]:
     return await asyncio.to_thread(_solve)
 
 
-async def _solve_recaptcha(sitekey: str, page_url: str) -> Optional[str]:
-    if not _solver:
-        return None
+async def _solve_recaptcha(sitekey, page_url):
+    if not _solver: return None
     def _solve():
         try:
             return _solver.recaptcha(sitekey=sitekey, url=page_url).get("code")
@@ -115,11 +113,10 @@ async def _solve_recaptcha(sitekey: str, page_url: str) -> Optional[str]:
     return await asyncio.to_thread(_solve)
 
 
-async def _detect_and_solve_captcha(page) -> bool:
+async def _detect_and_solve_captcha(page):
     try:
         hcap = await page.query_selector("iframe[src*='hcaptcha.com']")
         if hcap:
-            logger.info("[yopmail] hCaptcha detected")
             sitekey = None
             try:
                 src = await hcap.get_attribute("src")
@@ -152,7 +149,6 @@ async def _detect_and_solve_captcha(page) -> bool:
 
         recap = await page.query_selector("iframe[src*='recaptcha']")
         if recap:
-            logger.info("[yopmail] reCAPTCHA detected")
             sitekey = None
             try:
                 el = await page.query_selector("[data-sitekey]")
@@ -173,56 +169,159 @@ async def _detect_and_solve_captcha(page) -> bool:
         return False
 
 
-def _clean_email_html(html: str) -> str:
-    """ตัด Yopmail UI ออก เหลือเฉพาะเนื้อหาอีเมลจริง"""
+def _strip_fw_header(html: str) -> str:
+    """ตัด FW header block ออก เหลือเฉพาะเนื้อหาตั้งแต่ Subject: ลงไป"""
     if not html:
         return ""
 
-    # ลบ script/style/iframe
+    # ลองหา anchor: ข้อความตั้งแต่ "From:" จนถึง "Subject:" คือ FW header
+    # ตัดทุกอย่างก่อน "Subject:" (รวม Subject: line) ออก
+
+    # Method 1: ตัดจาก "From:" ถึงบรรทัดถัดจาก "Subject:"
+    # pattern ครอบคลุม: From: ... Sent: ... To: ... Subject: <subject>
+    fw_pattern = re.compile(
+        r"From\s*:.*?Subject\s*:[^\n<]*(?:</[^>]+>|\n|<br[^>]*>)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    html = fw_pattern.sub("", html)
+
+    # Method 2: ลบ "FW: ..." ที่ขึ้นต้นเนื้อหา
+    html = re.sub(r"^[\s\S]*?FW\s*:[^<\n]*(?:<br[^>]*>|\n)", "", html, flags=re.IGNORECASE)
+
+    # Method 3: ลบ pattern email header ที่เหลือ (Sunday, May... date line)
+    html = re.sub(
+        r"(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)(?:day)?,\s+[A-Z][a-z]+\s+\d+,\s+\d{4}\s+\d+:\d+:\d+\s*(?:AM|PM)?[^\n<]*",
+        "", html, flags=re.IGNORECASE,
+    )
+
+    # Method 4: ลบบรรทัด <email@domain> ที่เป็น sender info
+    html = re.sub(r"<[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+>", "", html)
+
+    # Method 5: ลบ "sXA3QDYhI AJwo3J0e" Yopmail random string at top
+    # pattern: 10-30 ตัวอักษรผสมตัวเลขที่ดูสุ่ม + อาจตามด้วย <email>
+    html = re.sub(r"^[\s\S]{0,80}?[A-Za-z][A-Za-z0-9]{8,20}\s+[A-Za-z][A-Za-z0-9]{4,20}\s*(?=<br|<p|<div|\n)", "", html, count=1)
+
+    return html
+
+
+def _clean_email_html(html: str) -> str:
+    """ตัด Yopmail UI + FW header ออก เหลือเฉพาะเนื้อหาอีเมลจริง"""
+    if not html:
+        return ""
+
+    # 1. ลบ script/style/iframe
     html = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"<style[\s\S]*?</style>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"<iframe[\s\S]*?</iframe>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"<noscript[\s\S]*?</noscript>", "", html, flags=re.IGNORECASE)
 
-    # ลบ Yopmail toolbar (div#nbmail, div.mb, button bar)
+    # 2. ลบ Yopmail toolbar
     html = re.sub(r"<div[^>]*id=[\"']nbmail[\"'][\s\S]*?</div>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"<div[^>]*class=[\"'][^\"']*\b(?:mb|nb|opt)\b[^\"']*[\"'][\s\S]*?</div>", "", html, flags=re.IGNORECASE)
 
-    # ลบปุ่มทั้งหมด (Yopmail ใช้ <button> สำหรับ Reply/Forward/Delete ฯลฯ)
+    # 3. ลบปุ่ม/input
     html = re.sub(r"<button[\s\S]*?</button>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"<input[^>]*type=[\"']?(?:button|submit|checkbox|radio)[\"']?[^>]*>", "", html, flags=re.IGNORECASE)
 
-    # ลบ FW header / mail-info block (เก็บเฉพาะเนื้อหา)
-    # Yopmail วาง header ใน div#mailmillieu, div.mailout, div#mail (ขึ้นกับ version)
-    # เราจะตัดเฉพาะถ้าเจอ pattern ที่บ่งบอกว่าเป็น header
-    html = re.sub(r"<div[^>]*\b(?:From|Sent|To|Subject)\s*:.*?</div>", "", html, flags=re.IGNORECASE | re.DOTALL)
+    # 4. ตัด FW header
+    html = _strip_fw_header(html)
 
-    # ลบ checkbox icons (ตัว □ ที่เห็นในรูป)
+    # 5. ลบ checkbox icons
     html = re.sub(r"[\u2610-\u2612\u25A0-\u25A1\u2B1B\u2B1C]", "", html)
 
-    # ลบ "Show pictures" link
+    # 6. ลบ "Show pictures"
     html = re.sub(r"<a[^>]*>\s*(?:Show\s*pictures|แสดง\s*รูป)\s*</a>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"(?:Show\s*pictures|แสดง\s*รูป)", "", html, flags=re.IGNORECASE)
 
-    # ลบ on* attributes
+    # 7. ลบ on* attributes + javascript:
     html = re.sub(r"\son\w+\s*=\s*\"[^\"]*\"", "", html, flags=re.IGNORECASE)
     html = re.sub(r"\son\w+\s*=\s*'[^']*'", "", html, flags=re.IGNORECASE)
     html = re.sub(r"javascript:", "blocked:", html, flags=re.IGNORECASE)
 
-    # ลบ class/id attributes ที่อ้างถึง Yopmail (ลด CSS conflict)
-    # html = re.sub(r"\sclass=[\"'][^\"']*[\"']", "", html)  # อย่าลบ class เพราะอีเมลจริงอาจใช้
-
-    # ลบ comments
+    # 8. ลบ comments
     html = re.sub(r"<!--[\s\S]*?-->", "", html)
 
-    # ลบ empty divs/spans ที่เกิดจากการลบ
-    for _ in range(3):
-        html = re.sub(r"<(div|span|p)[^>]*>\s*</\1>", "", html, flags=re.IGNORECASE)
+    # 9. ลบ empty tags ที่เกิดจากการลบ
+    for _ in range(4):
+        html = re.sub(r"<(div|span|p|td|tr)[^>]*>\s*</\1>", "", html, flags=re.IGNORECASE)
+        html = re.sub(r"<(div|span|p|td|tr)[^>]*>(?:&nbsp;|\s)*</\1>", "", html, flags=re.IGNORECASE)
 
     return html.strip()
 
 
-async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
+# ── Smart OTP extraction ที่ข้ามปี / เบอร์โทร ──
+def _smart_extract_code(text: str) -> Optional[str]:
+    """หาเลข OTP จาก text โดยข้ามปี ค.ศ./พ.ศ. และเบอร์โทร"""
+    if not text:
+        return None
+
+    # ปกติ OTP จะมี keyword ใกล้ๆ → priority สูง
+    priority_patterns = [
+        # ยืนยันด้วยรหัสนี้: 361609
+        r"ยืนยันด้วยรหัสนี้\s*[:：]?\s*([0-9]{4,8})",
+        r"ป้อนรหัสนี้เพื่อ\S{0,20}\s*[:：]?\s*([0-9]{4,8})",
+        r"ป้อน\s*รหัส\s*นี้\s*[:：]?\s*([0-9]{4,8})",
+        r"รหัสยืนยัน\s*[:：]?\s*([0-9]{4,8})",
+        r"รหัสเข้าสู่ระบบ\s*[:：]?\s*([0-9]{4,8})",
+        r"verification\s*code\s*[:：]?\s*([0-9]{4,8})",
+        r"sign[-\s]*in\s*code\s*[:：]?\s*([0-9]{4,8})",
+        r"login\s*code\s*[:：]?\s*([0-9]{4,8})",
+        r"enter\s*this\s*code\s*(?:to\s*sign\s*in)?\s*[:：]?\s*([0-9]{4,8})",
+        r"your\s*code\s*[:：]?\s*([0-9]{4,8})",
+    ]
+    for pat in priority_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            digits = m.group(1)
+            if _is_valid_otp(digits):
+                return digits
+
+    # spaced digits (3 6 1 6 0 9)
+    m6 = re.search(r"(?<!\d)((?:\d\s){5}\d)(?!\s*\d)", text)
+    if m6:
+        digits = re.sub(r"\s+", "", m6.group(1))
+        if _is_valid_otp(digits):
+            return digits
+
+    # หาเลข 6 หลัก หรือ 4 หลักทั้งหมด แล้วเลือกอันที่ valid
+    candidates = re.findall(r"(?<!\d)(\d{4,8})(?!\d)", text)
+    # priority: 6 หลักก่อน, ตามด้วย 8, 7, 5, 4
+    priority_lens = [6, 8, 7, 5, 4]
+    for plen in priority_lens:
+        for c in candidates:
+            if len(c) == plen and _is_valid_otp(c):
+                return c
+
+    return None
+
+
+def _is_valid_otp(digits: str) -> bool:
+    """ตรวจสอบว่าเลขชุดนี้น่าจะเป็น OTP จริงไหม"""
+    if not digits or not digits.isdigit():
+        return False
+    n = len(digits)
+    if n < 4 or n > 8:
+        return False
+    # ปี ค.ศ. 1900-2099
+    if n == 4 and re.match(r"^(19|20)\d{2}$", digits):
+        return False
+    # ปี พ.ศ. 2400-2700 (พ.ศ. 4 หลัก)
+    if n == 4 and re.match(r"^(24|25|26|27)\d{2}$", digits):
+        return False
+    # ปี พ.ศ. 4 หลักเฉยๆ ที่ปกติ (2400-2700)
+    val = int(digits) if n <= 4 else 0
+    if n == 4 and 2400 <= val <= 2799:
+        return False
+    # เลขซ้ำกันหมด เช่น 0000, 111111 → ไม่ใช่ OTP จริง
+    if len(set(digits)) == 1:
+        return False
+    # เบอร์โทร 8+ หลักที่ขึ้นต้น 02, 06, 08, 09
+    if n >= 8 and re.match(r"^0[2689]", digits):
+        return False
+    return True
+
+
+async def _fetch_latest_email(shortname, code_extractor) -> Dict[str, Any]:
     ctx = await _browser.new_context(
         viewport={"width": 420, "height": 740},
         user_agent=USER_AGENT,
@@ -330,15 +429,13 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
         if not first_mail_data:
             return {"success": False, "message": "ยังไม่มีอีเมลในกล่อง หรือระบบติด CAPTCHA", "empty": True}
 
-        # ── ดึง HTML เฉพาะจาก iframe ของอีเมล (ifmail) ──
-        # อย่าใช้ body ของ frame หลัก เพราะจะติด toolbar ของ Yopmail
+        # ดึง HTML จาก ifmail frame เท่านั้น (เนื้อหาล้วน ไม่มี toolbar)
         mail_html = ""
         mail_text = ""
         for f in page.frames:
             try:
                 fname = (f.name or "").lower()
                 furl = (f.url or "").lower()
-                # ifmail = frame ของเนื้อหาอีเมลล้วนๆ (ไม่มี toolbar)
                 if "ifmail" in fname or "/mail?b=" in furl or "/m?b=" in furl:
                     body = await f.query_selector("body")
                     if body:
@@ -350,12 +447,10 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
                             break
             except Exception: continue
 
-        # fallback: เลือก frame ที่ text ยาวที่สุด (น่าจะเป็นเนื้อหาอีเมล)
         if not mail_html:
             best_len = 0
             for f in page.frames:
                 try:
-                    # ข้าม inbox list frame
                     if "ifinbox" in (f.name or "").lower():
                         continue
                     body = await f.query_selector("body")
@@ -370,19 +465,28 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
         if not mail_html:
             return {"success": False, "message": "อ่านเนื้อหาอีเมลไม่สำเร็จ"}
 
-        # ── ทำความสะอาด HTML ──
-        clean_html = _clean_email_html(mail_html)
+        # ── ใช้ subject เป็น hint ในการหา code ──
+        subject = first_mail_data.get("subject", "")
 
-        # ── ดึง code จาก text ──
+        # ── ดึง code ใช้ smart extractor ก่อน fallback ไป code_extractor เดิม ──
         code = None
         try:
             search_text = mail_text or html_mod.unescape(re.sub(r"<[^>]+>", " ", mail_html))
-            code = code_extractor(search_text)
-        except Exception: pass
+            # ตัด FW header / mail header ออกจาก search text ก่อน
+            search_text = _strip_text_header(search_text)
+            code = _smart_extract_code(search_text)
+            if not code:
+                # fallback ใช้ extractor เดิม
+                code = code_extractor(search_text)
+        except Exception:
+            logger.exception("[yopmail] code extract error")
+
+        # ── Clean HTML ──
+        clean_html = _clean_email_html(mail_html)
 
         return {
             "success": True,
-            "subject": first_mail_data.get("subject", ""),
+            "subject": subject,
             "from": first_mail_data.get("from", ""),
             "date": first_mail_data.get("date", ""),
             "html": clean_html,
@@ -392,6 +496,21 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
         try:
             await ctx.close()
         except Exception: pass
+
+
+def _strip_text_header(text: str) -> str:
+    """ตัด FW header ใน plain text ออก เหลือเฉพาะเนื้อหา"""
+    if not text:
+        return ""
+    # ตัดทุกอย่างก่อน "Subject:" บรรทัดสุดท้าย (ถ้ามี)
+    lines = text.split("\n")
+    cut_idx = -1
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*Subject\s*:", line, re.IGNORECASE):
+            cut_idx = i
+    if cut_idx >= 0 and cut_idx < len(lines) - 1:
+        return "\n".join(lines[cut_idx + 1:])
+    return text
 
 
 def register_yopmail_routes(app: FastAPI, code_extractor):
@@ -422,8 +541,8 @@ def register_yopmail_routes(app: FastAPI, code_extractor):
             try:
                 t0 = time.time()
                 result = await _fetch_latest_email(shortname, code_extractor)
-                logger.info("[yopmail] fetch %s in %.2fs success=%s",
-                            shortname, time.time() - t0, result.get("success"))
+                logger.info("[yopmail] fetch %s in %.2fs success=%s code=%s",
+                            shortname, time.time() - t0, result.get("success"), result.get("code", "")[:3] + "***" if result.get("code") else "-")
                 return result
             except Exception:
                 logger.exception("[yopmail] fetch failed")
