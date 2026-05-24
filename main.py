@@ -362,6 +362,14 @@ async def bhagatflix_debug(email: str = "", action: str = "code") -> Dict[str, A
     result["apiData"]   = api_result.get("data")
     return result
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "OTP Python Server", "version": "1.0"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "timestamp": time.time()}
+
 @app.post("/get-otp")
 async def get_otp(data: OtpRequest) -> Dict[str, Any]:
     request_id   = make_request_id()
