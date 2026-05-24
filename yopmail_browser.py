@@ -45,15 +45,11 @@ class YopActionReq(BaseModel):
     token: str = ""
 
 async def yopmail_startup():
-    global _yop_browser, _yop_pw, _yop_semaphore, _yop_cleanup_task
+    global _yop_semaphore, _yop_cleanup_task
     _yop_semaphore = asyncio.Semaphore(YOPMAIL_MAX_SESSIONS)
-    try:
-        _yop_pw = await async_playwright().start()
-        _yop_browser = await _yop_pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-blink-features=AutomationControlled"])
-        logger.info("[yopmail] chromium launched (max=%d)", YOPMAIL_MAX_SESSIONS)
-    except Exception:
-        logger.exception("[yopmail] chromium launch failed"); _yop_browser = None
+    # ไม่ launch chromium ตรงนี้
     _yop_cleanup_task = asyncio.create_task(_cleanup_loop())
+    logger.info("[yopmail] ready (browser will launch on first request)")
 
 async def yopmail_shutdown():
     global _yop_browser, _yop_pw
@@ -110,11 +106,15 @@ def register_yopmail_routes(app: FastAPI, code_extractor):
     @app.post("/yopmail/start")
     async def yop_start(data: YopStartReq):
         if not _check_tok(data.token): return {"success":False,"message":"ไม่ได้รับอนุญาต"}
-        if _yop_browser is None: return {"success":False,"message":"ระบบบราวเซอร์ยังไม่พร้อม"}
-        email = str(data.email or "").replace(" ","").lower().strip()
-        shortname = email.split("@")[0] if "@" in email else email
-        if not shortname: return {"success":False,"message":"รูปแบบอีเมลไม่ถูกต้อง"}
-        if _yop_semaphore.locked() and _yop_semaphore._value == 0:
+if _yop_browser is None:
+    # Launch chromium ตอนนี้แหละ
+    try:
+        _yop_pw = await async_playwright().start()
+        _yop_browser = await _yop_pw.chromium.launch(...)
+        logger.info("[yopmail] chromium launched")
+    except Exception as e:
+        logger.exception("[yopmail] launch failed")
+        return {"success": False, "message": "เปิดบราวเซอร์ไม่สำเร็จ"}
             return {"success":False,"message":"ระบบกำลังใช้งานเต็ม กรุณารอสักครู่"}
         await _yop_semaphore.acquire()
         sid = base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
