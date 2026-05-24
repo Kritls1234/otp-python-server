@@ -4,8 +4,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# ติดตั้ง dependencies (ไม่รวม playwright เพราะ base image มีแล้ว)
-RUN pip install --no-cache-dir fastapi uvicorn[standard] pydantic telethon httpx gunicorn
+# ติดตั้ง Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
