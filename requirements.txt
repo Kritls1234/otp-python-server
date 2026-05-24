@@ -6,3 +6,4 @@ httpx
 gunicorn
 greenlet==3.1.1
 playwright==1.48.0
+2captcha-python==1.5.1
