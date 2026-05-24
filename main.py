@@ -33,6 +33,9 @@ API_HASH_2          = os.getenv("TG_API_HASH_2", "")
 TG_STRING_SESSION_2 = os.getenv("TG_STRING_SESSION_2", "")
 
 TIMEOUT_SECONDS             = float(os.getenv("TIMEOUT_SECONDS", "35"))
+# Per-account timeout overrides (fall back to TIMEOUT_SECONDS if not set)
+TIMEOUT_SECONDS_ACCOUNT1    = float(os.getenv("TIMEOUT_SECONDS_ACCOUNT1", str(TIMEOUT_SECONDS)))
+TIMEOUT_SECONDS_ACCOUNT2    = float(os.getenv("TIMEOUT_SECONDS_ACCOUNT2", "90"))
 SEMAPHORE_LIMIT             = int(os.getenv("SEMAPHORE_LIMIT", "15"))
 POLL_INTERVAL               = float(os.getenv("POLL_INTERVAL", "0.22"))
 MESSAGE_LIMIT               = int(os.getenv("MESSAGE_LIMIT", "18"))
@@ -130,6 +133,13 @@ def get_client(account_id: str) -> TelegramClient:
     if cli is None:
         raise RuntimeError(f"ระบบยังไม่ได้ตั้งค่า {account_id} กรุณาติดต่อผู้ดูแล")
     return cli
+
+
+def get_timeout_for_account(account_id: str) -> float:
+    """คืน timeout (วินาที) ตาม account_id."""
+    if account_id == "account2":
+        return TIMEOUT_SECONDS_ACCOUNT2
+    return TIMEOUT_SECONDS_ACCOUNT1
 
 # =========================
 # MODELS
@@ -984,7 +994,8 @@ async def wait_with_event_listener(
         )
 
     try:
-        return await asyncio.wait_for(future, timeout=TIMEOUT_SECONDS)
+        timeout = get_timeout_for_account(account_id)
+        return await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
         return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
     finally:
@@ -1001,10 +1012,11 @@ async def polling_fallback_to_future(
 ) -> None:
     try:
         start_time = asyncio.get_event_loop().time()
+        timeout    = get_timeout_for_account(account_id)
         while True:
             if future.done():
                 return
-            if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
+            if asyncio.get_event_loop().time() - start_time > timeout:
                 return
             messages = await get_new_messages(cli, target, after_id)
             for msg in messages:
@@ -1038,8 +1050,9 @@ async def wait_with_polling(
     selected_button: str, request_id: str, expect_buttons: bool, special_mode: bool,
 ) -> Dict[str, Any]:
     start_time = asyncio.get_event_loop().time()
+    timeout    = get_timeout_for_account(account_id)
     while True:
-        if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
+        if asyncio.get_event_loop().time() - start_time > timeout:
             return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
         messages = await get_new_messages(cli, target, after_id)
         for msg in messages:
