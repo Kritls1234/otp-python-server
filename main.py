@@ -22,9 +22,16 @@ from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 # =========================
 # ENV CONFIG
 # =========================
-API_ID                      = int(os.getenv("TG_API_ID", "0"))
-API_HASH                    = os.getenv("TG_API_HASH", "")
-TG_STRING_SESSION           = os.getenv("TG_STRING_SESSION", "")
+# ── Account 1 (default) ─────────────────────────────────────
+API_ID_1            = int(os.getenv("TG_API_ID", "0"))
+API_HASH_1          = os.getenv("TG_API_HASH", "")
+TG_STRING_SESSION_1 = os.getenv("TG_STRING_SESSION", "")
+
+# ── Account 2 (secondary) ───────────────────────────────────
+API_ID_2            = int(os.getenv("TG_API_ID_2", "0"))
+API_HASH_2          = os.getenv("TG_API_HASH_2", "")
+TG_STRING_SESSION_2 = os.getenv("TG_STRING_SESSION_2", "")
+
 TIMEOUT_SECONDS             = float(os.getenv("TIMEOUT_SECONDS", "35"))
 SEMAPHORE_LIMIT             = int(os.getenv("SEMAPHORE_LIMIT", "15"))
 POLL_INTERVAL               = float(os.getenv("POLL_INTERVAL", "0.22"))
@@ -66,25 +73,63 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("otp-server")
 
 # =========================
-# APP / CLIENT
+# APP / CLIENTS (DUAL ACCOUNT)
 # =========================
 app = FastAPI(title="OTP Python Server")
 
-client = TelegramClient(
-    StringSession(TG_STRING_SESSION),
-    API_ID,
-    API_HASH,
+# ── Client 1 ────────────────────────────────────────────────
+client1 = TelegramClient(
+    StringSession(TG_STRING_SESSION_1),
+    API_ID_1,
+    API_HASH_1,
     connection_retries=5,
     retry_delay=2,
     auto_reconnect=True,
 )
 
+# ── Client 2 (if configured) ────────────────────────────────
+client2: Optional[TelegramClient] = None
+if API_ID_2 and API_HASH_2 and TG_STRING_SESSION_2:
+    client2 = TelegramClient(
+        StringSession(TG_STRING_SESSION_2),
+        API_ID_2,
+        API_HASH_2,
+        connection_retries=5,
+        retry_delay=2,
+        auto_reconnect=True,
+    )
+
+# ── Account registry ────────────────────────────────────────
+CLIENTS: Dict[str, Optional[TelegramClient]] = {
+    "account1": client1,
+    "account2": client2,
+}
+
 semaphore          = asyncio.Semaphore(SEMAPHORE_LIMIT)
-entity_cache:      Dict[str, Any]            = {}
-bot_locks:         Dict[str, asyncio.Lock]   = {}
-active_by_bot:     Dict[str, int]            = defaultdict(int)
-pending_requests:  Dict[str, Dict[str, Any]] = {}
+# entity cache keyed by (account_id, bot_username)
+entity_cache:      Dict[tuple, Any]           = {}
+# bot locks keyed by (account_id, bot_username)
+bot_locks:         Dict[tuple, asyncio.Lock]  = {}
+active_by_bot:     Dict[tuple, int]           = defaultdict(int)
+pending_requests:  Dict[str, Dict[str, Any]]  = {}
 pending_lock       = asyncio.Lock()
+
+
+def normalize_account_id(account_id: Any) -> str:
+    """รับค่าจาก Sheet แล้ว normalize เป็น 'account1' หรือ 'account2'."""
+    value = str(account_id or "").strip().lower()
+    if value in ("account2", "acc2", "2"):
+        return "account2"
+    # default → account1 (รวมถึงค่าว่าง, account1, acc1, 1, อะไรก็ตามที่ไม่ใช่ account2)
+    return "account1"
+
+
+def get_client(account_id: str) -> TelegramClient:
+    """คืน TelegramClient ตาม account_id — ไม่ failover."""
+    cli = CLIENTS.get(account_id)
+    if cli is None:
+        raise RuntimeError(f"ระบบยังไม่ได้ตั้งค่า {account_id} กรุณาติดต่อผู้ดูแล")
+    return cli
 
 # =========================
 # MODELS
@@ -92,6 +137,7 @@ pending_lock       = asyncio.Lock()
 class OtpRequest(BaseModel):
     email:       str
     botUsername: str
+    accountId:   str = "account1"
 
 class ButtonRequest(BaseModel):
     email:       str
@@ -100,6 +146,7 @@ class ButtonRequest(BaseModel):
     col:         int = 0
     buttonText:  str = ""
     messageId:   int = 0
+    accountId:   str = "account1"
 
 class YopmailRequest(BaseModel):
     email: str
@@ -110,113 +157,129 @@ class YopmailRequest(BaseModel):
 # =========================
 @app.on_event("startup")
 async def startup() -> None:
-    if not API_ID or not API_HASH or not TG_STRING_SESSION:
-        logger.warning("Missing required Telegram environment variables")
+    if not API_ID_1 or not API_HASH_1 or not TG_STRING_SESSION_1:
+        logger.warning("Missing required Telegram env vars for account1")
 
-    await connect_telegram()
+    await connect_telegram(client1, "account1")
+
+    if client2 is not None:
+        await connect_telegram(client2, "account2")
+    else:
+        logger.info("account2 not configured (set TG_API_ID_2, TG_API_HASH_2, TG_STRING_SESSION_2 to enable)")
 
     if USE_EVENT_LISTENER:
         try:
-            register_event_listener()
+            register_event_listener(client1, "account1")
+            if client2 is not None:
+                register_event_listener(client2, "account2")
         except Exception:
             logger.exception("event listener register failed")
 
     asyncio.create_task(telegram_keepalive_loop())
 
     logger.info(
-        "server startup complete | bhagatflix_ready=%s | keepalive_interval=%ds",
+        "server startup complete | account1=%s | account2=%s | bhagatflix_ready=%s | keepalive=%ds",
+        "ready" if client1.is_connected() else "down",
+        "ready" if (client2 and client2.is_connected()) else ("down" if client2 else "not-configured"),
         bool(BHAGATFLIX_EMAIL and BHAGATFLIX_PASSWORD),
         KEEPALIVE_INTERVAL,
     )
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    try:
-        await client.disconnect()
-    except Exception:
-        pass
+    for account_id, cli in CLIENTS.items():
+        if cli is None:
+            continue
+        try:
+            await cli.disconnect()
+        except Exception:
+            pass
 
 # =========================
 # TELEGRAM CONNECTION HELPERS
 # =========================
-async def connect_telegram() -> None:
+async def connect_telegram(cli: TelegramClient, account_id: str) -> None:
     try:
-        await client.connect()
-        me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+        await cli.connect()
+        me = await asyncio.wait_for(cli.get_me(), timeout=10.0)
         if me:
-            logger.info("telegram connected as @%s (id=%s)", getattr(me, "username", "?"), getattr(me, "id", "?"))
+            logger.info("[%s] connected as @%s (id=%s)",
+                        account_id, getattr(me, "username", "?"), getattr(me, "id", "?"))
         else:
-            logger.warning("telegram connected but get_me() returned None")
+            logger.warning("[%s] connected but get_me() returned None", account_id)
     except Exception:
-        logger.exception("telegram connect failed")
+        logger.exception("[%s] connect failed", account_id)
 
-async def ensure_client_ready() -> None:
-    if not client.is_connected():
-        logger.warning("[ensure] client disconnected → reconnecting...")
+async def ensure_client_ready(cli: TelegramClient, account_id: str) -> None:
+    if not cli.is_connected():
+        logger.warning("[%s] disconnected → reconnecting...", account_id)
         try:
-            await client.connect()
+            await cli.connect()
         except Exception as exc:
-            logger.exception("[ensure] reconnect failed")
+            logger.exception("[%s] reconnect failed", account_id)
             raise RuntimeError("ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล") from exc
 
     try:
-        me = await asyncio.wait_for(client.get_me(), timeout=8.0)
+        me = await asyncio.wait_for(cli.get_me(), timeout=8.0)
         if me is None:
             raise RuntimeError("get_me returned None")
     except asyncio.TimeoutError:
-        logger.warning("[ensure] get_me() timeout → force reconnecting...")
-        await _force_reconnect()
+        logger.warning("[%s] get_me() timeout → force reconnecting...", account_id)
+        await _force_reconnect(cli, account_id)
     except Exception:
-        logger.exception("[ensure] get_me() failed → force reconnecting...")
-        await _force_reconnect()
+        logger.exception("[%s] get_me() failed → force reconnecting...", account_id)
+        await _force_reconnect(cli, account_id)
 
-async def _force_reconnect() -> None:
+async def _force_reconnect(cli: TelegramClient, account_id: str) -> None:
     try:
-        await asyncio.wait_for(client.disconnect(), timeout=5.0)
+        await asyncio.wait_for(cli.disconnect(), timeout=5.0)
     except Exception:
         pass
     await asyncio.sleep(1.5)
     try:
-        await client.connect()
-        me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+        await cli.connect()
+        me = await asyncio.wait_for(cli.get_me(), timeout=10.0)
         if me:
-            logger.info("[reconnect] ok @%s", getattr(me, "username", "?"))
+            logger.info("[%s] reconnect ok @%s", account_id, getattr(me, "username", "?"))
         else:
             raise RuntimeError("get_me returned None after reconnect")
     except Exception as exc:
-        logger.exception("[reconnect] failed")
+        logger.exception("[%s] reconnect failed", account_id)
         raise RuntimeError("ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล") from exc
 
 async def telegram_keepalive_loop() -> None:
     logger.info("[keepalive] started (interval=%ds)", KEEPALIVE_INTERVAL)
     while True:
         await asyncio.sleep(KEEPALIVE_INTERVAL)
-        try:
-            if not client.is_connected():
-                logger.warning("[keepalive] disconnected → reconnecting...")
-                await client.connect()
-                logger.info("[keepalive] reconnected ok")
+        for account_id, cli in CLIENTS.items():
+            if cli is None:
                 continue
-
-            me = await asyncio.wait_for(client.get_me(), timeout=8.0)
-            if me is None:
-                raise RuntimeError("get_me returned None")
-            logger.info("[keepalive] ok @%s", getattr(me, "username", "?"))
-
-        except asyncio.TimeoutError:
-            logger.warning("[keepalive] get_me() timeout → force reconnecting...")
             try:
-                await _force_reconnect()
-                logger.info("[keepalive] force reconnect ok")
+                if not cli.is_connected():
+                    logger.warning("[keepalive][%s] disconnected → reconnecting...", account_id)
+                    await cli.connect()
+                    logger.info("[keepalive][%s] reconnected ok", account_id)
+                    continue
+
+                me = await asyncio.wait_for(cli.get_me(), timeout=8.0)
+                if me is None:
+                    raise RuntimeError("get_me returned None")
+                logger.info("[keepalive][%s] ok @%s", account_id, getattr(me, "username", "?"))
+
+            except asyncio.TimeoutError:
+                logger.warning("[keepalive][%s] get_me() timeout → force reconnecting...", account_id)
+                try:
+                    await _force_reconnect(cli, account_id)
+                    logger.info("[keepalive][%s] force reconnect ok", account_id)
+                except Exception:
+                    logger.exception("[keepalive][%s] force reconnect failed", account_id)
+
+            except asyncio.CancelledError:
+                logger.info("[keepalive] cancelled")
+                return
+
             except Exception:
-                logger.exception("[keepalive] force reconnect failed")
-
-        except asyncio.CancelledError:
-            logger.info("[keepalive] cancelled")
-            return
-
-        except Exception:
-            logger.exception("[keepalive] unexpected error")
+                logger.exception("[keepalive][%s] unexpected error", account_id)
 
 # =========================
 # ROUTES
@@ -228,40 +291,37 @@ async def home() -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     request_id = make_request_id()
-    try:
-        connected   = client.is_connected()
-        authorized  = False
-        telegram_ok = False
-        username    = None
+    accounts_status: Dict[str, Any] = {}
 
-        if connected:
-            try:
-                me = await asyncio.wait_for(client.get_me(), timeout=6.0)
-                if me is not None:
-                    authorized  = True
-                    telegram_ok = True
-                    username    = getattr(me, "username", None)
-            except asyncio.TimeoutError:
-                authorized  = False
-                telegram_ok = False
-            except Exception:
-                authorized  = False
-                telegram_ok = False
+    for account_id, cli in CLIENTS.items():
+        if cli is None:
+            accounts_status[account_id] = {"configured": False}
+            continue
+        info = {"configured": True, "connected": False, "authorized": False, "username": None}
+        try:
+            info["connected"] = cli.is_connected()
+            if info["connected"]:
+                try:
+                    me = await asyncio.wait_for(cli.get_me(), timeout=6.0)
+                    if me is not None:
+                        info["authorized"] = True
+                        info["username"]   = getattr(me, "username", None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        accounts_status[account_id] = info
 
-        return {
-            "success":         True,
-            "status":          "ok" if telegram_ok else "not_ready",
-            "connected":       connected,
-            "authorized":      authorized,
-            "telegramOk":      telegram_ok,
-            "username":        username,
-            "bhagatflixReady": bool(BHAGATFLIX_EMAIL and BHAGATFLIX_PASSWORD),
-            "pendingRequests": len(pending_requests),
-            "requestId":       request_id,
-        }
-    except Exception as exc:
-        logger.exception("health failed")
-        return {"success": False, "status": "error", "message": sanitize_error(exc), "requestId": request_id}
+    overall_ok = any(s.get("authorized") for s in accounts_status.values())
+
+    return {
+        "success":         True,
+        "status":          "ok" if overall_ok else "not_ready",
+        "accounts":        accounts_status,
+        "bhagatflixReady": bool(BHAGATFLIX_EMAIL and BHAGATFLIX_PASSWORD),
+        "pendingRequests": len(pending_requests),
+        "requestId":       request_id,
+    }
 
 @app.get("/bhagatflix-debug")
 async def bhagatflix_debug(email: str = "", action: str = "code") -> Dict[str, Any]:
@@ -295,8 +355,10 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
     request_id   = make_request_id()
     email        = clean_email(data.email)
     bot_username = normalize_bot_username(data.botUsername)
+    account_id   = normalize_account_id(data.accountId)
 
-    logger.info("get_otp start requestId=%s email=%s system=%s", request_id, mask_email(email), bot_username)
+    logger.info("get_otp start requestId=%s email=%s system=%s account=%s",
+                request_id, mask_email(email), bot_username, account_id)
 
     if not email:
         return fail("กรุณากรอกอีเมล", request_id)
@@ -321,10 +383,16 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
             "requestId":   request_id,
         }
 
+    # ── route to the correct client ─────────────────────────
+    try:
+        cli = get_client(account_id)
+    except RuntimeError as exc:
+        return fail(str(exc), request_id)
+
     async with semaphore:
-        async with active_bot_request(bot_username):
+        async with active_bot_request(account_id, bot_username):
             try:
-                await ensure_client_ready()
+                await ensure_client_ready(cli, account_id)
 
                 if should_use_special_bot(bot_username):
                     return {
@@ -341,11 +409,12 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
                         "requestId":   request_id,
                     }
 
-                target = await get_cached_entity(bot_username)
-                async with optional_bot_lock(bot_username):
-                    sent_msg = await client.send_message(target, email)
+                target = await get_cached_entity(cli, account_id, bot_username)
+                async with optional_bot_lock(account_id, bot_username):
+                    sent_msg = await cli.send_message(target, email)
 
                 return await wait_for_buttons_or_result(
+                    cli=cli, account_id=account_id,
                     target=target, bot_username=bot_username, after_id=sent_msg.id,
                     email=email, selected_button="ขอโค้ดเข้าสู่ระบบ",
                     request_id=request_id, expect_buttons=True, special_mode=False,
@@ -361,6 +430,7 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
     email        = clean_email(data.email)
     bot_username = normalize_bot_username(data.botUsername)
     button_text  = clean_text(data.buttonText)
+    account_id   = normalize_account_id(data.accountId)
 
     if not email:
         return fail("กรุณากรอกอีเมล", request_id)
@@ -375,11 +445,16 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
             button_text=button_text, request_id=request_id,
         )
 
+    try:
+        cli = get_client(account_id)
+    except RuntimeError as exc:
+        return fail(str(exc), request_id)
+
     async with semaphore:
-        async with active_bot_request(bot_username):
+        async with active_bot_request(account_id, bot_username):
             try:
-                await ensure_client_ready()
-                target = await get_cached_entity(bot_username)
+                await ensure_client_ready(cli, account_id)
+                target = await get_cached_entity(cli, account_id, bot_username)
 
                 if should_use_special_bot(bot_username):
                     command_text = build_special_command(
@@ -388,16 +463,18 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                     )
                     if not command_text:
                         return fail("ไม่รู้จักเมนูที่เลือก กรุณาลองใหม่อีกครั้ง", request_id)
-                    async with optional_bot_lock(bot_username):
-                        sent_msg = await client.send_message(target, command_text)
+                    async with optional_bot_lock(account_id, bot_username):
+                        sent_msg = await cli.send_message(target, command_text)
                     return await wait_for_buttons_or_result(
+                        cli=cli, account_id=account_id,
                         target=target, bot_username=bot_username, after_id=sent_msg.id,
                         email=email,
                         selected_button=button_text or special_title_from_position(data.row, data.col),
                         request_id=request_id, expect_buttons=False, special_mode=True,
                     )
 
-                target_msg = await find_button_message(target=target, message_id=data.messageId, email=email)
+                target_msg = await find_button_message(cli=cli, target=target,
+                                                      message_id=data.messageId, email=email)
                 if not target_msg:
                     return fail("ไม่พบเมนู กรุณาลองใหม่อีกครั้ง", request_id)
 
@@ -408,6 +485,7 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                     return fail("กดเมนูไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", request_id)
 
                 first_result = await wait_for_buttons_or_result(
+                    cli=cli, account_id=account_id,
                     target=target, bot_username=bot_username, after_id=target_msg.id,
                     email=email, selected_button=button_text,
                     request_id=request_id, expect_buttons=False, special_mode=False,
@@ -418,7 +496,8 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                     if nested_buttons:
                         first_btn     = nested_buttons[0]
                         nested_msg_id = first_result.get("messageId") or 0
-                        nested_msg    = await find_button_message(target=target, message_id=nested_msg_id, email=email)
+                        nested_msg    = await find_button_message(cli=cli, target=target,
+                                                                  message_id=nested_msg_id, email=email)
                         if nested_msg:
                             ok = await click_target_button(
                                 msg=nested_msg,
@@ -428,6 +507,7 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                             )
                             if ok:
                                 return await wait_for_buttons_or_result(
+                                    cli=cli, account_id=account_id,
                                     target=target, bot_username=bot_username,
                                     after_id=nested_msg.id, email=email,
                                     selected_button=button_text,
@@ -442,7 +522,7 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                 return fail(sanitize_error(exc), request_id)
 
 # =========================
-# YOPMAIL
+# YOPMAIL (unchanged — no Telegram needed)
 # =========================
 class _YopmailIdParser(HTMLParser):
     """Parse mail IDs from Yopmail inbox HTML"""
@@ -470,7 +550,6 @@ class _YopmailIdParser(HTMLParser):
                 if val not in self._seen and val.lower() not in self._blacklist:
                     self._seen.add(val)
                     self.ids.append(val)
-        # readMail('ID') pattern in onclick
         onclick = attr_dict.get("onclick", "")
         if onclick:
             m = re.search(r"readMail\(['\"]([^'\"]{3,})['\"]\)", onclick)
@@ -529,7 +608,6 @@ async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
             headers=base_headers,
         ) as http:
 
-            # STEP 1: session + yjToken
             wm_url = f"https://yopmail.com/wm?login={urllib.parse.quote(shortname)}"
             wm_res = await http.get(wm_url)
             logger.info("[yopmail] wm status=%d", wm_res.status_code)
@@ -542,7 +620,6 @@ async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
                 yj_token = m.group(1)
             logger.info("[yopmail] yjToken=%s", yj_token or "NOT_FOUND")
 
-            # STEP 2: inbox
             inbox_url = (
                 f"https://yopmail.com/en/inbox"
                 f"?login={urllib.parse.quote(shortname)}"
@@ -555,11 +632,9 @@ async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
             )
             logger.info("[yopmail] inbox status=%d len=%d", inbox_res.status_code, len(inbox_res.text))
 
-            # STEP 3: parse IDs
             ids = _parse_yopmail_ids(inbox_res.text)
             logger.info("[yopmail] ids from inbox=%s", ids)
 
-            # Fallback A: /inbox without /en/
             if not ids:
                 fb_url = (
                     f"https://yopmail.com/inbox"
@@ -570,7 +645,6 @@ async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
                 ids = _parse_yopmail_ids(fb_res.text)
                 logger.info("[yopmail] ids from fallback-inbox=%s", ids)
 
-            # Fallback B: wm page itself
             if not ids:
                 ids = _parse_yopmail_ids(wm_res.text)
                 logger.info("[yopmail] ids from wm fallback=%s", ids)
@@ -578,7 +652,6 @@ async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
             if not ids:
                 return fail("ไม่พบอีเมลใน Yopmail กรุณาลองใหม่อีกครั้ง", request_id)
 
-            # STEP 4: fetch each mail
             emails_found: List[Dict[str, Any]] = []
             for i, mid in enumerate(ids[:5]):
                 mail_url = (
@@ -590,7 +663,6 @@ async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
                     headers={**base_headers, "Referer": str(inbox_res.url)},
                 )
 
-                # Fallback: without /en/
                 if mail_res.status_code < 200 or mail_res.status_code >= 300 or not mail_res.text:
                     mail_url2 = (
                         f"https://yopmail.com/mail"
@@ -627,7 +699,7 @@ async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
         return fail("ระบบไม่ตอบสนอง กรุณาลองใหม่อีกครั้ง", request_id)
 
 # =========================
-# BHAGATFLIX (Magic Window)
+# BHAGATFLIX (Magic Window) — unchanged
 # =========================
 def is_bhagatflix(bot_username: str) -> bool:
     return normalize_bot_username(bot_username) == BHAGATFLIX_BOT
@@ -805,26 +877,29 @@ async def handle_bhagatflix_click(
     return parse_bhagatflix_response(action, raw, request_id, email)
 
 # =========================
-# EVENT LISTENER (TELEGRAM)
+# EVENT LISTENER (per client)
 # =========================
-def register_event_listener() -> None:
-    @client.on(events.NewMessage(incoming=True))
+def register_event_listener(cli: TelegramClient, account_id: str) -> None:
+    @cli.on(events.NewMessage(incoming=True))
     async def on_new_message(event: Any) -> None:
         try:
             msg = event.message
             if not msg:
                 return
-            await dispatch_incoming_message(msg)
+            await dispatch_incoming_message(msg, account_id)
         except Exception:
-            logger.exception("event listener failed")
+            logger.exception("[%s] event listener failed", account_id)
 
-async def dispatch_incoming_message(msg: Any) -> None:
+async def dispatch_incoming_message(msg: Any, account_id: str) -> None:
     async with pending_lock:
         if not pending_requests:
             return
         matched_keys: List[str] = []
         for key, pending in list(pending_requests.items()):
             if pending.get("done"):
+                continue
+            # only match events from the same account that issued the request
+            if pending.get("account_id") != account_id:
                 continue
             after_id = int(pending.get("after_id") or 0)
             if msg.id <= after_id:
@@ -837,7 +912,8 @@ async def dispatch_incoming_message(msg: Any) -> None:
             if not result:
                 continue
             if not is_relevant_message(
-                msg=msg, bot_username=pending["bot_username"], email=pending["email"],
+                msg=msg, account_id=account_id,
+                bot_username=pending["bot_username"], email=pending["email"],
                 selected_button=pending["selected_button"], special_mode=pending["special_mode"],
             ):
                 continue
@@ -850,11 +926,13 @@ async def dispatch_incoming_message(msg: Any) -> None:
             pending_requests.pop(key, None)
 
 async def wait_for_buttons_or_result(
+    cli: TelegramClient, account_id: str,
     target: Any, bot_username: str, after_id: int, email: str,
     selected_button: str, request_id: str, expect_buttons: bool, special_mode: bool,
 ) -> Dict[str, Any]:
     if USE_EVENT_LISTENER:
         result = await wait_with_event_listener(
+            cli=cli, account_id=account_id,
             target=target, bot_username=bot_username, after_id=after_id, email=email,
             selected_button=selected_button, request_id=request_id,
             expect_buttons=expect_buttons, special_mode=special_mode,
@@ -862,12 +940,14 @@ async def wait_for_buttons_or_result(
         if result:
             return result
     return await wait_with_polling(
+        cli=cli, account_id=account_id,
         target=target, bot_username=bot_username, after_id=after_id, email=email,
         selected_button=selected_button, request_id=request_id,
         expect_buttons=expect_buttons, special_mode=special_mode,
     )
 
 async def wait_with_event_listener(
+    cli: TelegramClient, account_id: str,
     target: Any, bot_username: str, after_id: int, email: str,
     selected_button: str, request_id: str, expect_buttons: bool, special_mode: bool,
 ) -> Optional[Dict[str, Any]]:
@@ -880,6 +960,7 @@ async def wait_with_event_listener(
         pending_requests[pending_key] = {
             "future":          future,
             "request_id":      request_id,
+            "account_id":      account_id,
             "bot_username":    bot_username,
             "target_id":       target_id,
             "after_id":        after_id,
@@ -895,7 +976,8 @@ async def wait_with_event_listener(
     if USE_POLLING_FALLBACK:
         polling_task = asyncio.create_task(
             polling_fallback_to_future(
-                future=future, target=target, bot_username=bot_username,
+                future=future, cli=cli, account_id=account_id,
+                target=target, bot_username=bot_username,
                 after_id=after_id, email=email, selected_button=selected_button,
                 request_id=request_id, expect_buttons=expect_buttons, special_mode=special_mode,
             )
@@ -912,7 +994,8 @@ async def wait_with_event_listener(
             polling_task.cancel()
 
 async def polling_fallback_to_future(
-    future: asyncio.Future, target: Any, bot_username: str, after_id: int,
+    future: asyncio.Future, cli: TelegramClient, account_id: str,
+    target: Any, bot_username: str, after_id: int,
     email: str, selected_button: str, request_id: str,
     expect_buttons: bool, special_mode: bool,
 ) -> None:
@@ -923,7 +1006,7 @@ async def polling_fallback_to_future(
                 return
             if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
                 return
-            messages = await get_new_messages(target, after_id)
+            messages = await get_new_messages(cli, target, after_id)
             for msg in messages:
                 if future.done():
                     return
@@ -935,7 +1018,8 @@ async def polling_fallback_to_future(
                 if not result:
                     continue
                 if not is_relevant_message(
-                    msg=msg, bot_username=bot_username, email=email,
+                    msg=msg, account_id=account_id,
+                    bot_username=bot_username, email=email,
                     selected_button=selected_button, special_mode=special_mode,
                 ):
                     continue
@@ -949,6 +1033,7 @@ async def polling_fallback_to_future(
         logger.exception("polling fallback failed")
 
 async def wait_with_polling(
+    cli: TelegramClient, account_id: str,
     target: Any, bot_username: str, after_id: int, email: str,
     selected_button: str, request_id: str, expect_buttons: bool, special_mode: bool,
 ) -> Dict[str, Any]:
@@ -956,7 +1041,7 @@ async def wait_with_polling(
     while True:
         if asyncio.get_event_loop().time() - start_time > TIMEOUT_SECONDS:
             return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
-        messages = await get_new_messages(target, after_id)
+        messages = await get_new_messages(cli, target, after_id)
         for msg in messages:
             result = build_result_from_message(
                 msg=msg, bot_username=bot_username, email=email,
@@ -966,7 +1051,8 @@ async def wait_with_polling(
             if not result:
                 continue
             if is_relevant_message(
-                msg=msg, bot_username=bot_username, email=email,
+                msg=msg, account_id=account_id,
+                bot_username=bot_username, email=email,
                 selected_button=selected_button, special_mode=special_mode,
             ):
                 return result
@@ -990,20 +1076,20 @@ def build_result_from_message(
         return fail(no_data, request_id)
     return extract_code_or_link(msg=msg, selected_button=selected_button, request_id=request_id)
 
-async def get_new_messages(target: Any, after_id: int) -> List[Any]:
-    messages     = await client.get_messages(target, limit=MESSAGE_LIMIT)
+async def get_new_messages(cli: TelegramClient, target: Any, after_id: int) -> List[Any]:
+    messages     = await cli.get_messages(target, limit=MESSAGE_LIMIT)
     new_messages = [m for m in messages if m and m.id > after_id]
     new_messages.sort(key=lambda item: item.id)
     return new_messages
 
 # =========================
-# TELEGRAM HELPERS
+# TELEGRAM HELPERS (now per-client)
 # =========================
-async def get_cached_entity(bot_username: str) -> Any:
-    key = normalize_bot_username(bot_username)
+async def get_cached_entity(cli: TelegramClient, account_id: str, bot_username: str) -> Any:
+    key = (account_id, normalize_bot_username(bot_username))
     if key in entity_cache:
         return entity_cache[key]
-    entity            = await client.get_entity(key)
+    entity            = await cli.get_entity(key[1])
     entity_cache[key] = entity
     return entity
 
@@ -1017,8 +1103,8 @@ def get_entity_identity(entity: Any) -> Optional[str]:
     return None
 
 @asynccontextmanager
-async def active_bot_request(bot_username: str) -> AsyncGenerator[None, None]:
-    key = normalize_bot_username(bot_username)
+async def active_bot_request(account_id: str, bot_username: str) -> AsyncGenerator[None, None]:
+    key = (account_id, normalize_bot_username(bot_username))
     active_by_bot[key] += 1
     try:
         yield
@@ -1026,8 +1112,8 @@ async def active_bot_request(bot_username: str) -> AsyncGenerator[None, None]:
         active_by_bot[key] = max(0, active_by_bot[key] - 1)
 
 @asynccontextmanager
-async def optional_bot_lock(bot_username: str) -> AsyncGenerator[None, None]:
-    key = normalize_bot_username(bot_username)
+async def optional_bot_lock(account_id: str, bot_username: str) -> AsyncGenerator[None, None]:
+    key = (account_id, normalize_bot_username(bot_username))
     if not SAFE_SAME_BOT_QUEUE:
         yield
         return
@@ -1036,15 +1122,16 @@ async def optional_bot_lock(bot_username: str) -> AsyncGenerator[None, None]:
     async with bot_locks[key]:
         yield
 
-async def find_button_message(target: Any, message_id: int = 0, email: str = "") -> Optional[Any]:
+async def find_button_message(cli: TelegramClient, target: Any,
+                              message_id: int = 0, email: str = "") -> Optional[Any]:
     if message_id:
         try:
-            msg = await client.get_messages(target, ids=message_id)
+            msg = await cli.get_messages(target, ids=message_id)
             if msg and getattr(msg, "buttons", None):
                 return msg
         except Exception:
             pass
-    messages     = await client.get_messages(target, limit=MESSAGE_LIMIT)
+    messages     = await cli.get_messages(target, limit=MESSAGE_LIMIT)
     email_lower  = clean_email(email)
     fallback_msg = None
     for msg in messages:
@@ -1076,12 +1163,13 @@ async def click_target_button(msg: Any, row: int = 0, col: int = 0, button_text:
 # MATCHING / EXTRACTION
 # =========================
 def is_relevant_message(
-    msg: Any, bot_username: str, email: str, selected_button: str, special_mode: bool = False
+    msg: Any, account_id: str, bot_username: str, email: str,
+    selected_button: str, special_mode: bool = False
 ) -> bool:
     text         = html.unescape(msg.message or "")
     text_lower   = clean_text(text).lower()
     email_lower  = clean_email(email)
-    bot_key      = normalize_bot_username(bot_username)
+    bot_key      = (account_id, normalize_bot_username(bot_username))
     active_count = active_by_bot.get(bot_key, 0)
 
     if email_lower and email_lower in text_lower:
@@ -1243,9 +1331,9 @@ def pick_reset_url(urls: List[str], text: str) -> Optional[str]:
         if any(k in u for k in priority_keywords):
             return url
     for url in urls:
+        u = url.lower()
         if is_footer_url(url):
             continue
-        u = url.lower()
         if "netflix.com" in u or "nflxext" in u:
             return url
     return None
