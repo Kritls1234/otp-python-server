@@ -1,25 +1,35 @@
 """
-Yopmail HTML Reader — ดึง HTML จริงของอีเมลล่าสุด (ไม่ใช้ screenshot)
+Yopmail HTML Reader + 2Captcha Auto-Solver
+- เปิด yopmail.com -> ใส่ email -> ถ้าเจอ captcha -> 2Captcha solve
+- เข้า inbox -> คลิกอีเมลล่าสุด -> ดึง HTML จริง
 """
 import os, re, time, base64, asyncio, logging, urllib.parse, html as html_mod
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from playwright.async_api import async_playwright, Browser
 
+try:
+    from twocaptcha import TwoCaptcha
+    HAS_2CAPTCHA = True
+except ImportError:
+    HAS_2CAPTCHA = False
+
 logger = logging.getLogger("otp-server.yopmail")
 
-YOPMAIL_MAX_SESSIONS  = int(os.getenv("YOPMAIL_MAX_SESSIONS", "8"))
-YOPMAIL_NAV_TIMEOUT   = int(os.getenv("YOPMAIL_NAV_TIMEOUT_MS", "20000"))
+YOPMAIL_MAX_SESSIONS  = int(os.getenv("YOPMAIL_MAX_SESSIONS", "4"))
+YOPMAIL_NAV_TIMEOUT   = int(os.getenv("YOPMAIL_NAV_TIMEOUT_MS", "30000"))
 YOPMAIL_SESSION_TOKEN = os.getenv("YOPMAIL_SESSION_TOKEN", "kritticool_yop_7h2x9k4m")
 YOPMAIL_CORS_ORIGINS  = os.getenv("YOPMAIL_CORS_ORIGINS", "*").split(",")
+TWOCAPTCHA_API_KEY    = os.getenv("TWOCAPTCHA_API_KEY", "")
 USER_AGENT = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
 _browser: Optional[Browser] = None
 _pw = None
 _semaphore: Optional[asyncio.Semaphore] = None
 _launch_lock = asyncio.Lock()
+_solver = None
 
 
 class YopFetchReq(BaseModel):
@@ -28,7 +38,6 @@ class YopFetchReq(BaseModel):
 
 
 async def _ensure_browser():
-    """Lazy launch chromium on first request"""
     global _browser, _pw
     if _browser is not None:
         return True
@@ -39,7 +48,12 @@ async def _ensure_browser():
             _pw = await async_playwright().start()
             _browser = await _pw.chromium.launch(
                 headless=True,
-                args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-blink-features=AutomationControlled"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
             logger.info("[yopmail] chromium launched")
             return True
@@ -49,8 +63,17 @@ async def _ensure_browser():
 
 
 async def yopmail_startup():
-    global _semaphore
+    global _semaphore, _solver
     _semaphore = asyncio.Semaphore(YOPMAIL_MAX_SESSIONS)
+    if HAS_2CAPTCHA and TWOCAPTCHA_API_KEY:
+        try:
+            _solver = TwoCaptcha(TWOCAPTCHA_API_KEY, defaultTimeout=180, pollingInterval=5)
+            logger.info("[yopmail] 2Captcha solver ready")
+        except Exception:
+            logger.exception("[yopmail] 2Captcha init failed")
+            _solver = None
+    else:
+        logger.warning("[yopmail] 2Captcha disabled (no API key or library)")
     logger.info("[yopmail] ready (lazy launch on first request)")
 
 
@@ -69,8 +92,116 @@ def _check_tok(t):
     return (not YOPMAIL_SESSION_TOKEN) or t == YOPMAIL_SESSION_TOKEN
 
 
+async def _solve_hcaptcha(sitekey: str, page_url: str) -> Optional[str]:
+    if not _solver:
+        return None
+    def _solve():
+        try:
+            result = _solver.hcaptcha(sitekey=sitekey, url=page_url)
+            return result.get("code")
+        except Exception:
+            logger.exception("[yopmail] 2Captcha hCaptcha solve failed")
+            return None
+    return await asyncio.to_thread(_solve)
+
+
+async def _solve_recaptcha(sitekey: str, page_url: str) -> Optional[str]:
+    if not _solver:
+        return None
+    def _solve():
+        try:
+            result = _solver.recaptcha(sitekey=sitekey, url=page_url)
+            return result.get("code")
+        except Exception:
+            logger.exception("[yopmail] 2Captcha reCAPTCHA solve failed")
+            return None
+    return await asyncio.to_thread(_solve)
+
+
+async def _detect_and_solve_captcha(page) -> bool:
+    try:
+        # hCaptcha
+        hcap = await page.query_selector("iframe[src*='hcaptcha.com']")
+        if hcap:
+            logger.info("[yopmail] hCaptcha detected")
+            sitekey = None
+            try:
+                src = await hcap.get_attribute("src")
+                if src:
+                    m = re.search(r"sitekey=([a-f0-9\-]+)", src)
+                    if m:
+                        sitekey = m.group(1)
+            except Exception:
+                pass
+            if not sitekey:
+                try:
+                    el = await page.query_selector("[data-sitekey]")
+                    if el:
+                        sitekey = await el.get_attribute("data-sitekey")
+                except Exception:
+                    pass
+            if not sitekey:
+                logger.warning("[yopmail] hCaptcha sitekey not found")
+                return False
+
+            page_url = page.url
+            logger.info("[yopmail] solving hCaptcha sitekey=%s", sitekey[:12])
+            token = await _solve_hcaptcha(sitekey, page_url)
+            if not token:
+                return False
+            logger.info("[yopmail] hCaptcha solved, injecting token")
+            await page.evaluate(
+                """(token) => {
+                    const ta = document.querySelectorAll('textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]');
+                    ta.forEach(t => { t.value = token; t.style.display = 'block'; });
+                    try {
+                        const widgets = document.querySelectorAll('.h-captcha, [data-sitekey]');
+                        widgets.forEach(w => {
+                            const cb = w.getAttribute('data-callback');
+                            if (cb && typeof window[cb] === 'function') window[cb](token);
+                        });
+                    } catch(e) {}
+                }""",
+                token,
+            )
+            await page.wait_for_timeout(800)
+            return True
+
+        # reCAPTCHA
+        recap = await page.query_selector("iframe[src*='recaptcha']")
+        if recap:
+            logger.info("[yopmail] reCAPTCHA detected")
+            sitekey = None
+            try:
+                el = await page.query_selector("[data-sitekey]")
+                if el:
+                    sitekey = await el.get_attribute("data-sitekey")
+            except Exception:
+                pass
+            if not sitekey:
+                return False
+            page_url = page.url
+            logger.info("[yopmail] solving reCAPTCHA sitekey=%s", sitekey[:12])
+            token = await _solve_recaptcha(sitekey, page_url)
+            if not token:
+                return False
+            await page.evaluate(
+                """(token) => {
+                    const ta = document.querySelectorAll('textarea[name="g-recaptcha-response"]');
+                    ta.forEach(t => { t.value = token; t.style.display = 'block'; });
+                }""",
+                token,
+            )
+            await page.wait_for_timeout(800)
+            return True
+
+        return False
+    except Exception:
+        logger.exception("[yopmail] captcha detection error")
+        return False
+
+
 async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
-    """เปิด Yopmail → คลิกอีเมลล่าสุด → ดึง HTML"""
     ctx = await _browser.new_context(
         viewport={"width": 420, "height": 740},
         user_agent=USER_AGENT,
@@ -80,62 +211,119 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
         page = await ctx.new_page()
         page.set_default_timeout(YOPMAIL_NAV_TIMEOUT)
 
-        # เปิด inbox
-        inbox_url = f"https://yopmail.com/en/wm?login={urllib.parse.quote(shortname)}"
-        await page.goto(inbox_url, wait_until="domcontentloaded")
+        # เปิด homepage
+        await page.goto("https://yopmail.com/en/", wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
 
-        # หา iframe ของ inbox list (Yopmail ใช้ frame ชื่อ "ifinboxlist")
+        # ใส่ email
+        try:
+            await page.fill("#login", shortname, timeout=8000)
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        # กดปุ่ม
+        try:
+            await page.click("#refreshbut .md, #refreshbut", timeout=5000)
+        except Exception:
+            inbox_url = f"https://yopmail.com/en/wm?login={urllib.parse.quote(shortname)}"
+            await page.goto(inbox_url, wait_until="domcontentloaded")
+
+        await page.wait_for_timeout(2000)
+
+        # ตรวจสอบและแก้ captcha
+        for _ in range(2):
+            solved = await _detect_and_solve_captcha(page)
+            if solved:
+                await page.wait_for_timeout(2500)
+                try:
+                    submit = await page.query_selector("button[type=submit], input[type=submit], #yes")
+                    if submit:
+                        await submit.click()
+                        await page.wait_for_timeout(2500)
+                except Exception:
+                    pass
+            else:
+                break
+
+        # หา inbox frame
         list_frame = None
         for f in page.frames:
             try:
-                if "inbox" in (f.url or "").lower() or "ifinbox" in (f.name or "").lower():
+                fname = (f.name or "").lower()
+                furl = (f.url or "").lower()
+                if "ifinbox" in fname or "inbox" in furl:
                     list_frame = f
                     break
             except Exception:
                 continue
 
-        # ลอง click อีเมลแรก
+        # คลิกอีเมลแรก
         first_mail_data = None
         try:
             if list_frame:
-                # อีเมลใน Yopmail อยู่ใน div.m หรือ button.lm
-                await list_frame.wait_for_selector("button.lm, div.m", timeout=5000)
+                await list_frame.wait_for_selector("button.lm, div.m", timeout=8000)
                 first_mail = await list_frame.query_selector("button.lm, div.m")
                 if first_mail:
-                    # ดึง metadata จาก list
-                    subject = ""
-                    sender = ""
-                    date = ""
+                    subject = sender = date = ""
                     try:
-                        subject_el = await first_mail.query_selector(".lms")
-                        if subject_el:
-                            subject = (await subject_el.inner_text()).strip()
-                    except Exception:
-                        pass
+                        el = await first_mail.query_selector(".lms")
+                        if el: subject = (await el.inner_text() or "").strip()
+                    except Exception: pass
                     try:
-                        sender_el = await first_mail.query_selector(".lmf")
-                        if sender_el:
-                            sender = (await sender_el.inner_text()).strip()
-                    except Exception:
-                        pass
+                        el = await first_mail.query_selector(".lmf")
+                        if el: sender = (await el.inner_text() or "").strip()
+                    except Exception: pass
                     try:
-                        date_el = await first_mail.query_selector(".lmh")
-                        if date_el:
-                            date = (await date_el.inner_text()).strip()
-                    except Exception:
-                        pass
-
+                        el = await first_mail.query_selector(".lmh")
+                        if el: date = (await el.inner_text() or "").strip()
+                    except Exception: pass
                     first_mail_data = {"subject": subject, "from": sender, "date": date}
                     await first_mail.click()
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(1800)
         except Exception:
             logger.exception("[yopmail] click first mail failed")
 
+        # captcha รอบ 2 (กรณีคลิกแล้วเจอ)
         if not first_mail_data:
-            return {"success": False, "message": "ยังไม่มีอีเมลในกล่อง", "empty": True}
+            solved = await _detect_and_solve_captcha(page)
+            if solved:
+                await page.wait_for_timeout(2500)
+                for f in page.frames:
+                    try:
+                        if "ifinbox" in (f.name or "").lower() or "inbox" in (f.url or "").lower():
+                            list_frame = f
+                            break
+                    except Exception:
+                        continue
+                if list_frame:
+                    try:
+                        await list_frame.wait_for_selector("button.lm, div.m", timeout=6000)
+                        first_mail = await list_frame.query_selector("button.lm, div.m")
+                        if first_mail:
+                            subject = sender = date = ""
+                            try:
+                                el = await first_mail.query_selector(".lms")
+                                if el: subject = (await el.inner_text() or "").strip()
+                            except Exception: pass
+                            try:
+                                el = await first_mail.query_selector(".lmf")
+                                if el: sender = (await el.inner_text() or "").strip()
+                            except Exception: pass
+                            try:
+                                el = await first_mail.query_selector(".lmh")
+                                if el: date = (await el.inner_text() or "").strip()
+                            except Exception: pass
+                            first_mail_data = {"subject": subject, "from": sender, "date": date}
+                            await first_mail.click()
+                            await page.wait_for_timeout(1800)
+                    except Exception:
+                        pass
 
-        # ดึง HTML ของอีเมลจาก iframe "ifmail"
+        if not first_mail_data:
+            return {"success": False, "message": "ยังไม่มีอีเมลในกล่อง หรือระบบติด CAPTCHA", "empty": True}
+
+        # ดึง HTML
         mail_html = ""
         mail_text = ""
         for f in page.frames:
@@ -145,22 +333,23 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
                 if "ifmail" in fname or "/mail?" in furl or "/m?" in furl:
                     body = await f.query_selector("body")
                     if body:
-                        mail_html = await body.inner_html()
-                        mail_text = await body.inner_text()
-                        if mail_html and len(mail_html) > 50:
+                        html_content = await body.inner_html()
+                        text_content = await body.inner_text()
+                        if html_content and len(html_content) > 50:
+                            mail_html = html_content
+                            mail_text = text_content or ""
                             break
             except Exception:
                 continue
 
-        # fallback: ลองจากทุก frame
         if not mail_html:
             for f in page.frames:
                 try:
                     body = await f.query_selector("body")
                     if body:
                         html_content = await body.inner_html()
-                        text_content = await body.inner_text()
-                        if len(text_content or "") > len(mail_text or ""):
+                        text_content = await body.inner_text() or ""
+                        if len(text_content) > len(mail_text):
                             mail_html = html_content
                             mail_text = text_content
                 except Exception:
@@ -169,10 +358,10 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
         if not mail_html:
             return {"success": False, "message": "อ่านเนื้อหาอีเมลไม่สำเร็จ"}
 
-        # extract code
         code = None
         try:
-            code = code_extractor(mail_text or html_mod.unescape(re.sub(r"<[^>]+>", " ", mail_html)))
+            search_text = mail_text or html_mod.unescape(re.sub(r"<[^>]+>", " ", mail_html))
+            code = code_extractor(search_text)
         except Exception:
             pass
 
@@ -192,11 +381,11 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
 
 
 def _sanitize_html(html: str) -> str:
-    """ลบ script tags, on* attributes, javascript: links เพื่อความปลอดภัย"""
     if not html:
         return ""
     html = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"<style[\s\S]*?</style>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<iframe[\s\S]*?</iframe>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"\son\w+\s*=\s*\"[^\"]*\"", "", html, flags=re.IGNORECASE)
     html = re.sub(r"\son\w+\s*=\s*'[^']*'", "", html, flags=re.IGNORECASE)
     html = re.sub(r"javascript:", "blocked:", html, flags=re.IGNORECASE)
@@ -231,8 +420,10 @@ def register_yopmail_routes(app: FastAPI, code_extractor):
             try:
                 t0 = time.time()
                 result = await _fetch_latest_email(shortname, code_extractor)
-                logger.info("[yopmail] fetch %s in %.2fs success=%s",
-                            shortname, time.time() - t0, result.get("success"))
+                logger.info(
+                    "[yopmail] fetch %s in %.2fs success=%s",
+                    shortname, time.time() - t0, result.get("success")
+                )
                 return result
             except Exception:
                 logger.exception("[yopmail] fetch failed")
