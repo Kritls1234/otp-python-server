@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
-
+from yopmail_browser import yopmail_startup, yopmail_shutdown, register_yopmail_routes
 # =========================
 # ENV CONFIG
 # =========================
@@ -79,7 +79,7 @@ logger = logging.getLogger("otp-server")
 # APP / CLIENTS (DUAL ACCOUNT)
 # =========================
 app = FastAPI(title="OTP Python Server")
-
+register_yopmail_routes(app, extract_code)
 # ── Client 1 ────────────────────────────────────────────────
 client1 = TelegramClient(
     StringSession(TG_STRING_SESSION_1),
@@ -169,6 +169,7 @@ class YopmailRequest(BaseModel):
 async def startup() -> None:
     if not API_ID_1 or not API_HASH_1 or not TG_STRING_SESSION_1:
         logger.warning("Missing required Telegram env vars for account1")
+    await yopmail_startup()  # ← เพิ่มบรรทัดนี้
 
     await connect_telegram(client1, "account1")
 
@@ -196,7 +197,8 @@ async def startup() -> None:
     )
 
 @app.on_event("shutdown")
-async def shutdown() -> None:
+async def shutdown():
+    await yopmail_shutdown()  # ← เพิ่ม
     for account_id, cli in CLIENTS.items():
         if cli is None:
             continue
