@@ -4,20 +4,21 @@ import json
 import uuid
 import html
 import time
+import base64
 import asyncio
 import logging
 import urllib.parse
 from contextlib import asynccontextmanager
 from collections import defaultdict
-from html.parser import HTMLParser
-from typing import Any, Dict, List, Optional, AsyncGenerator, Set
-
+from typing import Any, Dict, List, Optional, AsyncGenerator, Set, Callable
 import httpx
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 # =========================
 # ENV CONFIG
@@ -53,11 +54,24 @@ BHAGATFLIX_ENDPOINTS = {
     "household": "/api/household-code",
     "reset":     "/api/reset-link",
 }
-
 _bhagat_token_cache: Dict[str, Any] = {
     "access_token": None, "refresh_token": None, "expires_at": 0
 }
 _bhagat_token_lock = asyncio.Lock()
+
+# ---- Yopmail Browser ----
+YOPMAIL_MAX_SESSIONS      = int(os.getenv("YOPMAIL_MAX_SESSIONS", "6"))
+YOPMAIL_SESSION_TTL       = int(os.getenv("YOPMAIL_SESSION_TTL", "240"))
+YOPMAIL_CLEANUP_INTERVAL  = int(os.getenv("YOPMAIL_CLEANUP_INTERVAL", "30"))
+YOPMAIL_VIEWPORT_W        = int(os.getenv("YOPMAIL_VIEWPORT_W", "420"))
+YOPMAIL_VIEWPORT_H        = int(os.getenv("YOPMAIL_VIEWPORT_H", "740"))
+YOPMAIL_NAV_TIMEOUT_MS    = int(os.getenv("YOPMAIL_NAV_TIMEOUT_MS", "25000"))
+YOPMAIL_SESSION_TOKEN     = os.getenv("YOPMAIL_SESSION_TOKEN", "kritticool_yop_7h2x9k4m")
+YOPMAIL_CORS_ORIGINS      = os.getenv("YOPMAIL_CORS_ORIGINS", "*").split(",")
+YOPMAIL_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+)
 
 # =========================
 # LOGGING
@@ -69,6 +83,13 @@ logger = logging.getLogger("otp-server")
 # APP / CLIENT
 # =========================
 app = FastAPI(title="OTP Python Server")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=YOPMAIL_CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 client = TelegramClient(
     StringSession(TG_STRING_SESSION),
@@ -101,9 +122,19 @@ class ButtonRequest(BaseModel):
     buttonText:  str = ""
     messageId:   int = 0
 
-class YopmailRequest(BaseModel):
+class YopStartRequest(BaseModel):
     email: str
-    mode:  str = "household"
+    token: str = ""
+
+class YopClickRequest(BaseModel):
+    token:  str = ""
+    x:      float
+    y:      float
+    view_w: float = 0
+    view_h: float = 0
+
+class YopActionRequest(BaseModel):
+    token: str = ""
 
 # =========================
 # STARTUP / SHUTDOWN
@@ -112,17 +143,14 @@ class YopmailRequest(BaseModel):
 async def startup() -> None:
     if not API_ID or not API_HASH or not TG_STRING_SESSION:
         logger.warning("Missing required Telegram environment variables")
-
     await connect_telegram()
-
     if USE_EVENT_LISTENER:
         try:
             register_event_listener()
         except Exception:
             logger.exception("event listener register failed")
-
     asyncio.create_task(telegram_keepalive_loop())
-
+    await yopmail_startup()
     logger.info(
         "server startup complete | bhagatflix_ready=%s | keepalive_interval=%ds",
         bool(BHAGATFLIX_EMAIL and BHAGATFLIX_PASSWORD),
@@ -131,6 +159,10 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    try:
+        await yopmail_shutdown()
+    except Exception:
+        pass
     try:
         await client.disconnect()
     except Exception:
@@ -158,7 +190,6 @@ async def ensure_client_ready() -> None:
         except Exception as exc:
             logger.exception("[ensure] reconnect failed")
             raise RuntimeError("ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล") from exc
-
     try:
         me = await asyncio.wait_for(client.get_me(), timeout=8.0)
         if me is None:
@@ -197,12 +228,10 @@ async def telegram_keepalive_loop() -> None:
                 await client.connect()
                 logger.info("[keepalive] reconnected ok")
                 continue
-
             me = await asyncio.wait_for(client.get_me(), timeout=8.0)
             if me is None:
                 raise RuntimeError("get_me returned None")
             logger.info("[keepalive] ok @%s", getattr(me, "username", "?"))
-
         except asyncio.TimeoutError:
             logger.warning("[keepalive] get_me() timeout → force reconnecting...")
             try:
@@ -210,11 +239,9 @@ async def telegram_keepalive_loop() -> None:
                 logger.info("[keepalive] force reconnect ok")
             except Exception:
                 logger.exception("[keepalive] force reconnect failed")
-
         except asyncio.CancelledError:
             logger.info("[keepalive] cancelled")
             return
-
         except Exception:
             logger.exception("[keepalive] unexpected error")
 
@@ -233,7 +260,6 @@ async def health() -> Dict[str, Any]:
         authorized  = False
         telegram_ok = False
         username    = None
-
         if connected:
             try:
                 me = await asyncio.wait_for(client.get_me(), timeout=6.0)
@@ -247,7 +273,6 @@ async def health() -> Dict[str, Any]:
             except Exception:
                 authorized  = False
                 telegram_ok = False
-
         return {
             "success":         True,
             "status":          "ok" if telegram_ok else "not_ready",
@@ -256,6 +281,7 @@ async def health() -> Dict[str, Any]:
             "telegramOk":      telegram_ok,
             "username":        username,
             "bhagatflixReady": bool(BHAGATFLIX_EMAIL and BHAGATFLIX_PASSWORD),
+            "yopmailReady":    _yop_browser is not None,
             "pendingRequests": len(pending_requests),
             "requestId":       request_id,
         }
@@ -267,11 +293,9 @@ async def health() -> Dict[str, Any]:
 async def bhagatflix_debug(email: str = "", action: str = "code") -> Dict[str, Any]:
     if not BHAGATFLIX_EMAIL or not BHAGATFLIX_PASSWORD:
         return {"step": "config", "ok": False, "error": "Missing BHAGATFLIX_EMAIL or BHAGATFLIX_PASSWORD env vars"}
-
     token_data = await get_bhagatflix_token()
     if not token_data or not token_data.get("access_token"):
         return {"step": "login", "ok": False, "error": "Supabase login failed - check email/password"}
-
     result = {
         "step":         "login",
         "ok":           True,
@@ -280,7 +304,6 @@ async def bhagatflix_debug(email: str = "", action: str = "code") -> Dict[str, A
     }
     if not email:
         return result
-
     if action not in BHAGATFLIX_ENDPOINTS:
         action = "code"
     api_result = await call_bhagatflix_api(action, email)
@@ -295,9 +318,7 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
     request_id   = make_request_id()
     email        = clean_email(data.email)
     bot_username = normalize_bot_username(data.botUsername)
-
     logger.info("get_otp start requestId=%s email=%s system=%s", request_id, mask_email(email), bot_username)
-
     if not email:
         return fail("กรุณากรอกอีเมล", request_id)
     if not bot_username:
@@ -325,7 +346,6 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
         async with active_bot_request(bot_username):
             try:
                 await ensure_client_ready()
-
                 if should_use_special_bot(bot_username):
                     return {
                         "success":    False,
@@ -340,17 +360,14 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
                         "specialMode": True,
                         "requestId":   request_id,
                     }
-
                 target = await get_cached_entity(bot_username)
                 async with optional_bot_lock(bot_username):
                     sent_msg = await client.send_message(target, email)
-
                 return await wait_for_buttons_or_result(
                     target=target, bot_username=bot_username, after_id=sent_msg.id,
                     email=email, selected_button="ขอโค้ดเข้าสู่ระบบ",
                     request_id=request_id, expect_buttons=True, special_mode=False,
                 )
-
             except Exception as exc:
                 logger.exception("get_otp error")
                 return fail(sanitize_error(exc), request_id)
@@ -361,7 +378,6 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
     email        = clean_email(data.email)
     bot_username = normalize_bot_username(data.botUsername)
     button_text  = clean_text(data.buttonText)
-
     if not email:
         return fail("กรุณากรอกอีเมล", request_id)
     if not bot_username:
@@ -380,7 +396,6 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
             try:
                 await ensure_client_ready()
                 target = await get_cached_entity(bot_username)
-
                 if should_use_special_bot(bot_username):
                     command_text = build_special_command(
                         button_text=button_text, email=email,
@@ -396,23 +411,19 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                         selected_button=button_text or special_title_from_position(data.row, data.col),
                         request_id=request_id, expect_buttons=False, special_mode=True,
                     )
-
                 target_msg = await find_button_message(target=target, message_id=data.messageId, email=email)
                 if not target_msg:
                     return fail("ไม่พบเมนู กรุณาลองใหม่อีกครั้ง", request_id)
-
                 clicked = await click_target_button(
                     msg=target_msg, row=data.row, col=data.col, button_text=button_text,
                 )
                 if not clicked:
                     return fail("กดเมนูไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", request_id)
-
                 first_result = await wait_for_buttons_or_result(
                     target=target, bot_username=bot_username, after_id=target_msg.id,
                     email=email, selected_button=button_text,
                     request_id=request_id, expect_buttons=False, special_mode=False,
                 )
-
                 if first_result and first_result.get("needButton") and first_result.get("buttons"):
                     nested_buttons = first_result.get("buttons") or []
                     if nested_buttons:
@@ -434,197 +445,283 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                                     request_id=request_id,
                                     expect_buttons=False, special_mode=False,
                                 )
-
                 return first_result
-
             except Exception as exc:
                 logger.exception("click_button error")
                 return fail(sanitize_error(exc), request_id)
 
-# =========================
-# YOPMAIL
-# =========================
-class _YopmailIdParser(HTMLParser):
-    """Parse mail IDs from Yopmail inbox HTML"""
-    def __init__(self):
-        super().__init__()
-        self.ids: List[str] = []
-        self._seen: Set[str] = set()
-        self._blacklist = {
-            "mail", "inbox", "page", "login", "spam",
-            "ctrl", "true", "false", "undefined", "null",
-        }
+# ═══════════════════════════════════════════════════════════
+# YOPMAIL — Browser Session (Playwright + Screenshot)
+# ═══════════════════════════════════════════════════════════
+class YopmailSession:
+    __slots__ = ("id", "email", "shortname", "context", "page",
+                 "created_at", "last_active", "lock", "closed")
 
-    def handle_starttag(self, tag: str, attrs: list) -> None:
-        attr_dict = dict(attrs)
-        for key in ("id", "data-id"):
-            val = attr_dict.get(key, "")
-            if val and len(val) >= 3 and val not in self._seen and val.lower() not in self._blacklist:
-                self._seen.add(val)
-                self.ids.append(val)
-        href = attr_dict.get("href", "")
-        if href:
-            m = re.search(r"[?&]id=([^&\"'\\s]{3,})", href)
-            if m:
-                val = m.group(1)
-                if val not in self._seen and val.lower() not in self._blacklist:
-                    self._seen.add(val)
-                    self.ids.append(val)
-        # readMail('ID') pattern in onclick
-        onclick = attr_dict.get("onclick", "")
-        if onclick:
-            m = re.search(r"readMail\(['\"]([^'\"]{3,})['\"]\)", onclick)
-            if m:
-                val = m.group(1)
-                if val not in self._seen and val.lower() not in self._blacklist:
-                    self._seen.add(val)
-                    self.ids.append(val)
+    def __init__(self, sid: str, email: str, shortname: str,
+                 context: BrowserContext, page: Page):
+        self.id          = sid
+        self.email       = email
+        self.shortname   = shortname
+        self.context     = context
+        self.page        = page
+        self.created_at  = time.time()
+        self.last_active = time.time()
+        self.lock        = asyncio.Lock()
+        self.closed      = False
 
-def _parse_yopmail_ids(html_text: str) -> List[str]:
-    parser = _YopmailIdParser()
+    def touch(self) -> None:
+        self.last_active = time.time()
+
+
+_yop_browser: Optional[Browser]             = None
+_yop_pw                                      = None
+_yop_sessions: Dict[str, YopmailSession]     = {}
+_yop_store_lock                              = asyncio.Lock()
+_yop_semaphore: Optional[asyncio.Semaphore]  = None
+_yop_cleanup_task: Optional[asyncio.Task]    = None
+
+
+async def yopmail_startup() -> None:
+    global _yop_browser, _yop_pw, _yop_semaphore, _yop_cleanup_task
+    _yop_semaphore = asyncio.Semaphore(YOPMAIL_MAX_SESSIONS)
     try:
-        parser.feed(html_text)
+        _yop_pw = await async_playwright().start()
+        _yop_browser = await _yop_pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        logger.info("[yopmail] chromium launched (max_sessions=%d)", YOPMAIL_MAX_SESSIONS)
+    except Exception:
+        logger.exception("[yopmail] chromium launch failed")
+        _yop_browser = None
+    _yop_cleanup_task = asyncio.create_task(_yopmail_cleanup_loop())
+
+
+async def yopmail_shutdown() -> None:
+    global _yop_browser, _yop_pw
+    if _yop_cleanup_task:
+        _yop_cleanup_task.cancel()
+    async with _yop_store_lock:
+        for sess in list(_yop_sessions.values()):
+            await _close_session_obj(sess)
+        _yop_sessions.clear()
+    try:
+        if _yop_browser:
+            await _yop_browser.close()
+        if _yop_pw:
+            await _yop_pw.stop()
     except Exception:
         pass
-    return parser.ids[:5]
 
-def _extract_yopmail_subject(html_text: str) -> str:
-    m = re.search(r'<div[^>]*class="[^"]*ellipsis[^"]*"[^>]*>([^<]+)</div>', html_text, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'<title>([^<]+)</title>', html_text, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return ""
 
-def _extract_yopmail_body(html_text: str) -> str:
-    m = re.search(r'<div[^>]*id="mail"[^>]*>([\s\S]*?)</div>', html_text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r'<div[^>]*class="[^"]*mail[^"]*"[^>]*>([\s\S]*?)</div>', html_text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    return html_text
+async def _yopmail_cleanup_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(YOPMAIL_CLEANUP_INTERVAL)
+            now = time.time()
+            async with _yop_store_lock:
+                expired = [s for s in _yop_sessions.values()
+                           if now - s.last_active > YOPMAIL_SESSION_TTL]
+                for sess in expired:
+                    logger.info("[yopmail] session %s expired → closing", sess.id[:8])
+                    await _close_session_obj(sess)
+                    _yop_sessions.pop(sess.id, None)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("[yopmail] cleanup loop error")
 
-@app.post("/get-yopmail")
-async def get_yopmail(data: YopmailRequest) -> Dict[str, Any]:
-    request_id = make_request_id()
-    email      = clean_email(data.email)
-    shortname  = email.split("@")[0]
 
-    if not shortname:
-        return fail("รูปแบบอีเมลไม่ถูกต้อง", request_id)
-
-    base_headers = {
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer":         "https://yopmail.com/",
-    }
-
+async def _close_session_obj(sess: YopmailSession) -> None:
+    if sess.closed:
+        return
+    sess.closed = True
     try:
-        async with httpx.AsyncClient(
-            timeout=25.0,
-            follow_redirects=True,
-            headers=base_headers,
-        ) as http:
+        await sess.context.close()
+    except Exception:
+        pass
+    finally:
+        if _yop_semaphore:
+            try:
+                _yop_semaphore.release()
+            except ValueError:
+                pass
 
-            # STEP 1: session + yjToken
-            wm_url = f"https://yopmail.com/wm?login={urllib.parse.quote(shortname)}"
-            wm_res = await http.get(wm_url)
-            logger.info("[yopmail] wm status=%d", wm_res.status_code)
 
-            yj_token = ""
-            m = re.search(r'var\s+yjToken\s*=\s*["\']([^"\']+)["\']', wm_res.text, re.IGNORECASE)
-            if not m:
-                m = re.search(r'[?&]yj=([a-zA-Z0-9]+)', wm_res.text)
-            if m:
-                yj_token = m.group(1)
-            logger.info("[yopmail] yjToken=%s", yj_token or "NOT_FOUND")
+def _yop_check_token(token: str) -> bool:
+    if not YOPMAIL_SESSION_TOKEN:
+        return True
+    return token == YOPMAIL_SESSION_TOKEN
 
-            # STEP 2: inbox
-            inbox_url = (
-                f"https://yopmail.com/en/inbox"
-                f"?login={urllib.parse.quote(shortname)}"
-                f"&p=1&d=&ctrl=&scrl=&spam=true"
-                f"&yj={urllib.parse.quote(yj_token)}&v=10.0"
+
+async def _yop_try_extract_code(sess: YopmailSession) -> Optional[str]:
+    """อ่านเนื้อหาอีเมลที่เปิดอยู่ (ไล่ทุก frame เพราะ Yopmail ใช้ iframe ifmail)
+       แล้วส่งให้ extract_code ของเดิมหาโค้ด"""
+    try:
+        text = ""
+        for frame in sess.page.frames:
+            try:
+                body = await frame.inner_text("body", timeout=1200)
+                if body and len(body) > len(text):
+                    text = body
+            except Exception:
+                continue
+        if not text:
+            try:
+                text = await sess.page.inner_text("#mail", timeout=1200)
+            except Exception:
+                text = ""
+        if not text:
+            return None
+        return extract_code(text)
+    except Exception:
+        return None
+
+
+@app.post("/yopmail/start")
+async def yopmail_start(data: YopStartRequest) -> Dict[str, Any]:
+    if not _yop_check_token(data.token):
+        return {"success": False, "message": "ไม่ได้รับอนุญาต"}
+    if _yop_browser is None:
+        return {"success": False, "message": "ระบบบราวเซอร์ยังไม่พร้อม กรุณาลองใหม่"}
+
+    email = clean_email(data.email)
+    shortname = email.split("@")[0] if "@" in email else email
+    if not shortname:
+        return {"success": False, "message": "รูปแบบอีเมลไม่ถูกต้อง"}
+
+    if _yop_semaphore.locked() and _yop_semaphore._value == 0:  # type: ignore
+        return {"success": False, "message": "ระบบกำลังใช้งานเต็ม กรุณารอสักครู่แล้วลองใหม่"}
+
+    await _yop_semaphore.acquire()
+    sid = base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
+    try:
+        context = await _yop_browser.new_context(
+            viewport={"width": YOPMAIL_VIEWPORT_W, "height": YOPMAIL_VIEWPORT_H},
+            user_agent=YOPMAIL_USER_AGENT,
+            locale="en-US",
+            device_scale_factor=1,
+        )
+        page = await context.new_page()
+        page.set_default_timeout(YOPMAIL_NAV_TIMEOUT_MS)
+
+        await page.goto("https://yopmail.com/en/", wait_until="domcontentloaded")
+        try:
+            await page.fill("#login", shortname, timeout=8000)
+            await page.click("#refreshbut .md", timeout=5000)
+        except Exception:
+            await page.goto(
+                f"https://yopmail.com/en/wm?login={urllib.parse.quote(shortname)}",
+                wait_until="domcontentloaded",
             )
-            inbox_res = await http.get(
-                inbox_url,
-                headers={**base_headers, "Referer": str(wm_res.url)},
-            )
-            logger.info("[yopmail] inbox status=%d len=%d", inbox_res.status_code, len(inbox_res.text))
 
-            # STEP 3: parse IDs
-            ids = _parse_yopmail_ids(inbox_res.text)
-            logger.info("[yopmail] ids from inbox=%s", ids)
+        sess = YopmailSession(sid, email, shortname, context, page)
+        async with _yop_store_lock:
+            _yop_sessions[sid] = sess
 
-            # Fallback A: /inbox without /en/
-            if not ids:
-                fb_url = (
-                    f"https://yopmail.com/inbox"
-                    f"?login={urllib.parse.quote(shortname)}"
-                    f"&p=1&yj={urllib.parse.quote(yj_token)}"
-                )
-                fb_res = await http.get(fb_url, headers=base_headers)
-                ids = _parse_yopmail_ids(fb_res.text)
-                logger.info("[yopmail] ids from fallback-inbox=%s", ids)
+        logger.info("[yopmail] session %s started for %s", sid[:8], shortname)
+        return {
+            "success": True,
+            "session_id": sid,
+            "view_w": YOPMAIL_VIEWPORT_W,
+            "view_h": YOPMAIL_VIEWPORT_H,
+        }
+    except Exception:
+        logger.exception("[yopmail] start failed")
+        if _yop_semaphore:
+            try:
+                _yop_semaphore.release()
+            except ValueError:
+                pass
+        return {"success": False, "message": "เปิดบราวเซอร์ไม่สำเร็จ กรุณาลองใหม่"}
 
-            # Fallback B: wm page itself
-            if not ids:
-                ids = _parse_yopmail_ids(wm_res.text)
-                logger.info("[yopmail] ids from wm fallback=%s", ids)
 
-            if not ids:
-                return fail("ไม่พบอีเมลใน Yopmail กรุณาลองใหม่อีกครั้ง", request_id)
+@app.get("/yopmail/shot/{session_id}")
+async def yopmail_shot(session_id: str, token: str = "") -> Dict[str, Any]:
+    if not _yop_check_token(token):
+        return {"success": False, "message": "ไม่ได้รับอนุญาต"}
+    sess = _yop_sessions.get(session_id)
+    if not sess or sess.closed:
+        return {"success": False, "message": "เซสชันหมดอายุ", "expired": True}
 
-            # STEP 4: fetch each mail
-            emails_found: List[Dict[str, Any]] = []
-            for i, mid in enumerate(ids[:5]):
-                mail_url = (
-                    f"https://yopmail.com/en/mail"
-                    f"?b={urllib.parse.quote(shortname)}&id={urllib.parse.quote(mid)}"
-                )
-                mail_res = await http.get(
-                    mail_url,
-                    headers={**base_headers, "Referer": str(inbox_res.url)},
-                )
-
-                # Fallback: without /en/
-                if mail_res.status_code < 200 or mail_res.status_code >= 300 or not mail_res.text:
-                    mail_url2 = (
-                        f"https://yopmail.com/mail"
-                        f"?b={urllib.parse.quote(shortname)}&id={urllib.parse.quote(mid)}"
-                    )
-                    mail_res = await http.get(mail_url2, headers=base_headers)
-
-                if mail_res.status_code >= 200 and mail_res.status_code < 300 and mail_res.text:
-                    subject      = _extract_yopmail_subject(mail_res.text)
-                    html_content = _extract_yopmail_body(mail_res.text)
-                    emails_found.append({
-                        "id":           mid,
-                        "to":           email,
-                        "from":         "",
-                        "subject":      subject,
-                        "html":         html_content,
-                        "internalDate": int(time.time() * 1000) - (i * 60000),
-                    })
-                    logger.info("[yopmail] mail %s subject=%s", mid, subject)
-
-                await asyncio.sleep(0.3)
-
-            if not emails_found:
-                return fail("ไม่พบเนื้อหาอีเมลใน Yopmail", request_id)
-
+    async with sess.lock:
+        sess.touch()
+        try:
+            code = await _yop_try_extract_code(sess)
+            if code:
+                return {
+                    "success": True,
+                    "found_code": True,
+                    "code": code,
+                    "title": ("รหัสยืนยัน 6 หลัก" if len(code) == 6 else "รหัสเข้าสู่ระบบ"),
+                }
+            png = await sess.page.screenshot(type="jpeg", quality=55)
+            b64 = base64.b64encode(png).decode()
             return {
-                "success":   True,
-                "emails":    emails_found,
-                "requestId": request_id,
+                "success": True,
+                "found_code": False,
+                "img": "data:image/jpeg;base64," + b64,
+                "view_w": YOPMAIL_VIEWPORT_W,
+                "view_h": YOPMAIL_VIEWPORT_H,
             }
+        except Exception:
+            logger.exception("[yopmail] screenshot failed")
+            return {"success": False, "message": "ถ่ายภาพหน้าจอไม่สำเร็จ"}
 
-    except Exception as exc:
-        logger.exception("[yopmail] error")
-        return fail("ระบบไม่ตอบสนอง กรุณาลองใหม่อีกครั้ง", request_id)
+
+@app.post("/yopmail/click/{session_id}")
+async def yopmail_click(session_id: str, data: YopClickRequest) -> Dict[str, Any]:
+    if not _yop_check_token(data.token):
+        return {"success": False, "message": "ไม่ได้รับอนุญาต"}
+    sess = _yop_sessions.get(session_id)
+    if not sess or sess.closed:
+        return {"success": False, "message": "เซสชันหมดอายุ", "expired": True}
+
+    async with sess.lock:
+        sess.touch()
+        try:
+            sx = (YOPMAIL_VIEWPORT_W / data.view_w) if data.view_w else 1.0
+            sy = (YOPMAIL_VIEWPORT_H / data.view_h) if data.view_h else 1.0
+            real_x = max(0, min(YOPMAIL_VIEWPORT_W, data.x * sx))
+            real_y = max(0, min(YOPMAIL_VIEWPORT_H, data.y * sy))
+            await sess.page.mouse.click(real_x, real_y)
+            return {"success": True}
+        except Exception:
+            logger.exception("[yopmail] click failed")
+            return {"success": False, "message": "คลิกไม่สำเร็จ"}
+
+
+@app.post("/yopmail/refresh/{session_id}")
+async def yopmail_refresh(session_id: str, data: YopActionRequest) -> Dict[str, Any]:
+    if not _yop_check_token(data.token):
+        return {"success": False, "message": "ไม่ได้รับอนุญาต"}
+    sess = _yop_sessions.get(session_id)
+    if not sess or sess.closed:
+        return {"success": False, "message": "เซสชันหมดอายุ", "expired": True}
+    async with sess.lock:
+        sess.touch()
+        try:
+            await sess.page.reload(wait_until="domcontentloaded")
+            return {"success": True}
+        except Exception:
+            return {"success": False, "message": "รีเฟรชไม่สำเร็จ"}
+
+
+@app.post("/yopmail/close/{session_id}")
+async def yopmail_close(session_id: str, data: YopActionRequest) -> Dict[str, Any]:
+    if not _yop_check_token(data.token):
+        return {"success": False, "message": "ไม่ได้รับอนุญาต"}
+    async with _yop_store_lock:
+        sess = _yop_sessions.pop(session_id, None)
+    if sess:
+        await _close_session_obj(sess)
+        logger.info("[yopmail] session %s closed", session_id[:8])
+    return {"success": True}
 
 # =========================
 # BHAGATFLIX (Magic Window)
@@ -749,10 +846,8 @@ def parse_bhagatflix_response(
                 if "not authenticated" in err_lower or "unauthorized" in err_lower:
                     msg = "ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแล"
         return fail(msg, request_id)
-
     data   = raw.get("data") or {}
     emails = data.get("emails") if isinstance(data, dict) else None
-
     if isinstance(emails, list) and emails:
         first     = emails[0] or {}
         html_body = first.get("html") or first.get("body") or ""
@@ -773,7 +868,6 @@ def parse_bhagatflix_response(
             "magicWindow": True,
             "requestId":   request_id,
         }
-
     if isinstance(data, dict):
         html_single    = data.get("html") or data.get("body") or ""
         subject_single = data.get("subject") or title
@@ -792,7 +886,6 @@ def parse_bhagatflix_response(
                 "magicWindow": True,
                 "requestId":   request_id,
             }
-
     return fail("ไม่พบข้อมูล กรุณาลองใหม่อีกครั้ง", request_id)
 
 async def handle_bhagatflix_click(
@@ -875,7 +968,6 @@ async def wait_with_event_listener(
     future: asyncio.Future = loop.create_future()
     pending_key = request_id
     target_id   = get_entity_identity(target)
-
     async with pending_lock:
         pending_requests[pending_key] = {
             "future":          future,
@@ -890,7 +982,6 @@ async def wait_with_event_listener(
             "created_at":      time.time(),
             "done":            False,
         }
-
     polling_task: Optional[asyncio.Task] = None
     if USE_POLLING_FALLBACK:
         polling_task = asyncio.create_task(
@@ -900,7 +991,6 @@ async def wait_with_event_listener(
                 request_id=request_id, expect_buttons=expect_buttons, special_mode=special_mode,
             )
         )
-
     try:
         return await asyncio.wait_for(future, timeout=TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -1083,18 +1173,14 @@ def is_relevant_message(
     email_lower  = clean_email(email)
     bot_key      = normalize_bot_username(bot_username)
     active_count = active_by_bot.get(bot_key, 0)
-
     if email_lower and email_lower in text_lower:
         return True
-
     selected_lower = clean_text(selected_button).lower()
     no_data = extract_no_data_message(text)
     if no_data and email_lower and email_lower in text_lower:
         return True
-
     if active_count <= 1:
         return True
-
     if selected_lower:
         if is_reset_choice(selected_lower):
             if "reset" in text_lower or "password" in text_lower or extract_urls_from_message(msg):
@@ -1105,19 +1191,15 @@ def is_relevant_message(
         if is_code_choice(selected_lower):
             if looks_like_code_message(text_lower):
                 return ALLOW_UNMATCHED_CONCURRENT
-
     if special_mode and ALLOW_UNMATCHED_CONCURRENT:
         return True
-
     return False
 
 def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Optional[Dict[str, Any]]:
     text           = html.unescape(msg.message or "")
     selected_lower = clean_text(selected_button).lower()
-
     is_reset_request     = any(k in selected_lower for k in ("reset", "รีเซ็ต", "pwlink", "password", "ลิงก์"))
     is_household_request = any(k in selected_lower for k in ("ครัวเรือน", "household", "travel", "verify"))
-
     if is_reset_request:
         urls      = extract_urls_from_message(msg)
         reset_url = pick_reset_url(urls, text)
@@ -1126,45 +1208,34 @@ def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Opt
         if urls:
             return _link_result(selected_button, text, urls[0], request_id)
         return None
-
     if is_household_request:
         urls       = extract_urls_from_message(msg)
         text_lower = clean_text(text).lower()
-
         household_url = pick_household_url(urls, text)
         if household_url:
             return _link_result(selected_button, text, household_url, request_id)
-
         household_code = extract_household_code(text)
         if household_code:
             return _code_result(selected_button, text, household_code, request_id)
-
         link_hints = ("click here", "verify here", "this link", "ลิงก์", "กดลิงก์", "คลิก")
         if urls and any(h in text_lower for h in link_hints):
             return _link_result(selected_button, text, urls[0], request_id)
-
         if urls:
             netflix_url = next((u for u in urls if "netflix" in u.lower() or "nflxext" in u.lower()), None)
             if netflix_url and not is_footer_url(netflix_url):
                 return _link_result(selected_button, text, netflix_url, request_id)
-
         code = extract_code(text)
         if code:
             return _code_result(selected_button, text, code, request_id)
-
         if urls:
             return _link_result(selected_button, text, urls[0], request_id)
-
         return None
-
     code = extract_code(text)
     if code:
         return _code_result(selected_button, text, code, request_id)
-
     urls = extract_urls_from_message(msg)
     if urls:
         return _link_result(selected_button, text, urls[0], request_id)
-
     return None
 
 def _code_result(selected_button: str, text: str, value: str, request_id: str) -> Dict[str, Any]:
@@ -1314,7 +1385,6 @@ def extract_urls_from_message(msg: Any) -> List[str]:
     urls: List[str] = []
     text     = html.unescape(msg.message or "")
     entities = getattr(msg, "entities", None) or []
-
     for entity in entities:
         if isinstance(entity, MessageEntityTextUrl):
             url = getattr(entity, "url", None)
@@ -1327,17 +1397,14 @@ def extract_urls_from_message(msg: Any) -> List[str]:
                     urls.append(raw_url)
             except Exception:
                 pass
-
     for url in re.findall(r"https?://[^\s<>\]\)\"']+", text, re.IGNORECASE):
         urls.append(url)
-
     if getattr(msg, "buttons", None):
         for row in msg.buttons:
             for button in row:
                 url = getattr(button, "url", None)
                 if url:
                     urls.append(url)
-
     return unique_list(clean_url(url) for url in urls if url)
 
 def detect_title_from_text(text: str) -> str:
@@ -1463,6 +1530,9 @@ def sanitize_error(error: Any) -> str:
         (r"exception",     "ระบบ"),
         (r"supabase",      "ระบบ"),
         (r"bhagatflix",    "ระบบ"),
+        (r"yopmail",       "ระบบ"),
+        (r"playwright",    "ระบบ"),
+        (r"chromium",      "ระบบ"),
     )
     for pattern, repl in replacements:
         raw = re.sub(pattern, repl, raw, flags=re.IGNORECASE)
