@@ -1,9 +1,8 @@
 """
-Yopmail HTML Reader + 2Captcha Auto-Solver
-- เปิด yopmail.com -> ใส่ email -> ถ้าเจอ captcha -> 2Captcha solve
-- เข้า inbox -> คลิกอีเมลล่าสุด -> ดึง HTML จริง
+Yopmail HTML Reader + 2Captcha — Clean Content Only
+- ดึงเฉพาะเนื้อหาอีเมล ตัดปุ่ม Yopmail / FW header / Show pictures ออก
 """
-import os, re, time, base64, asyncio, logging, urllib.parse, html as html_mod
+import os, re, time, asyncio, logging, urllib.parse, html as html_mod
 from typing import Any, Dict, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,7 +73,7 @@ async def yopmail_startup():
             _solver = None
     else:
         logger.warning("[yopmail] 2Captcha disabled (no API key or library)")
-    logger.info("[yopmail] ready (lazy launch on first request)")
+    logger.info("[yopmail] ready")
 
 
 async def yopmail_shutdown():
@@ -97,10 +96,9 @@ async def _solve_hcaptcha(sitekey: str, page_url: str) -> Optional[str]:
         return None
     def _solve():
         try:
-            result = _solver.hcaptcha(sitekey=sitekey, url=page_url)
-            return result.get("code")
+            return _solver.hcaptcha(sitekey=sitekey, url=page_url).get("code")
         except Exception:
-            logger.exception("[yopmail] 2Captcha hCaptcha solve failed")
+            logger.exception("[yopmail] hCaptcha solve failed")
             return None
     return await asyncio.to_thread(_solve)
 
@@ -110,17 +108,15 @@ async def _solve_recaptcha(sitekey: str, page_url: str) -> Optional[str]:
         return None
     def _solve():
         try:
-            result = _solver.recaptcha(sitekey=sitekey, url=page_url)
-            return result.get("code")
+            return _solver.recaptcha(sitekey=sitekey, url=page_url).get("code")
         except Exception:
-            logger.exception("[yopmail] 2Captcha reCAPTCHA solve failed")
+            logger.exception("[yopmail] reCAPTCHA solve failed")
             return None
     return await asyncio.to_thread(_solve)
 
 
 async def _detect_and_solve_captcha(page) -> bool:
     try:
-        # hCaptcha
         hcap = await page.query_selector("iframe[src*='hcaptcha.com']")
         if hcap:
             logger.info("[yopmail] hCaptcha detected")
@@ -129,27 +125,16 @@ async def _detect_and_solve_captcha(page) -> bool:
                 src = await hcap.get_attribute("src")
                 if src:
                     m = re.search(r"sitekey=([a-f0-9\-]+)", src)
-                    if m:
-                        sitekey = m.group(1)
-            except Exception:
-                pass
+                    if m: sitekey = m.group(1)
+            except Exception: pass
             if not sitekey:
                 try:
                     el = await page.query_selector("[data-sitekey]")
-                    if el:
-                        sitekey = await el.get_attribute("data-sitekey")
-                except Exception:
-                    pass
-            if not sitekey:
-                logger.warning("[yopmail] hCaptcha sitekey not found")
-                return False
-
-            page_url = page.url
-            logger.info("[yopmail] solving hCaptcha sitekey=%s", sitekey[:12])
-            token = await _solve_hcaptcha(sitekey, page_url)
-            if not token:
-                return False
-            logger.info("[yopmail] hCaptcha solved, injecting token")
+                    if el: sitekey = await el.get_attribute("data-sitekey")
+                except Exception: pass
+            if not sitekey: return False
+            token = await _solve_hcaptcha(sitekey, page.url)
+            if not token: return False
             await page.evaluate(
                 """(token) => {
                     const ta = document.querySelectorAll('textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]');
@@ -161,44 +146,80 @@ async def _detect_and_solve_captcha(page) -> bool:
                             if (cb && typeof window[cb] === 'function') window[cb](token);
                         });
                     } catch(e) {}
-                }""",
-                token,
-            )
+                }""", token)
             await page.wait_for_timeout(800)
             return True
 
-        # reCAPTCHA
         recap = await page.query_selector("iframe[src*='recaptcha']")
         if recap:
             logger.info("[yopmail] reCAPTCHA detected")
             sitekey = None
             try:
                 el = await page.query_selector("[data-sitekey]")
-                if el:
-                    sitekey = await el.get_attribute("data-sitekey")
-            except Exception:
-                pass
-            if not sitekey:
-                return False
-            page_url = page.url
-            logger.info("[yopmail] solving reCAPTCHA sitekey=%s", sitekey[:12])
-            token = await _solve_recaptcha(sitekey, page_url)
-            if not token:
-                return False
+                if el: sitekey = await el.get_attribute("data-sitekey")
+            except Exception: pass
+            if not sitekey: return False
+            token = await _solve_recaptcha(sitekey, page.url)
+            if not token: return False
             await page.evaluate(
                 """(token) => {
                     const ta = document.querySelectorAll('textarea[name="g-recaptcha-response"]');
                     ta.forEach(t => { t.value = token; t.style.display = 'block'; });
-                }""",
-                token,
-            )
+                }""", token)
             await page.wait_for_timeout(800)
             return True
-
         return False
     except Exception:
-        logger.exception("[yopmail] captcha detection error")
         return False
+
+
+def _clean_email_html(html: str) -> str:
+    """ตัด Yopmail UI ออก เหลือเฉพาะเนื้อหาอีเมลจริง"""
+    if not html:
+        return ""
+
+    # ลบ script/style/iframe
+    html = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<style[\s\S]*?</style>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<iframe[\s\S]*?</iframe>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<noscript[\s\S]*?</noscript>", "", html, flags=re.IGNORECASE)
+
+    # ลบ Yopmail toolbar (div#nbmail, div.mb, button bar)
+    html = re.sub(r"<div[^>]*id=[\"']nbmail[\"'][\s\S]*?</div>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<div[^>]*class=[\"'][^\"']*\b(?:mb|nb|opt)\b[^\"']*[\"'][\s\S]*?</div>", "", html, flags=re.IGNORECASE)
+
+    # ลบปุ่มทั้งหมด (Yopmail ใช้ <button> สำหรับ Reply/Forward/Delete ฯลฯ)
+    html = re.sub(r"<button[\s\S]*?</button>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<input[^>]*type=[\"']?(?:button|submit|checkbox|radio)[\"']?[^>]*>", "", html, flags=re.IGNORECASE)
+
+    # ลบ FW header / mail-info block (เก็บเฉพาะเนื้อหา)
+    # Yopmail วาง header ใน div#mailmillieu, div.mailout, div#mail (ขึ้นกับ version)
+    # เราจะตัดเฉพาะถ้าเจอ pattern ที่บ่งบอกว่าเป็น header
+    html = re.sub(r"<div[^>]*\b(?:From|Sent|To|Subject)\s*:.*?</div>", "", html, flags=re.IGNORECASE | re.DOTALL)
+
+    # ลบ checkbox icons (ตัว □ ที่เห็นในรูป)
+    html = re.sub(r"[\u2610-\u2612\u25A0-\u25A1\u2B1B\u2B1C]", "", html)
+
+    # ลบ "Show pictures" link
+    html = re.sub(r"<a[^>]*>\s*(?:Show\s*pictures|แสดง\s*รูป)\s*</a>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"(?:Show\s*pictures|แสดง\s*รูป)", "", html, flags=re.IGNORECASE)
+
+    # ลบ on* attributes
+    html = re.sub(r"\son\w+\s*=\s*\"[^\"]*\"", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"\son\w+\s*=\s*'[^']*'", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"javascript:", "blocked:", html, flags=re.IGNORECASE)
+
+    # ลบ class/id attributes ที่อ้างถึง Yopmail (ลด CSS conflict)
+    # html = re.sub(r"\sclass=[\"'][^\"']*[\"']", "", html)  # อย่าลบ class เพราะอีเมลจริงอาจใช้
+
+    # ลบ comments
+    html = re.sub(r"<!--[\s\S]*?-->", "", html)
+
+    # ลบ empty divs/spans ที่เกิดจากการลบ
+    for _ in range(3):
+        html = re.sub(r"<(div|span|p)[^>]*>\s*</\1>", "", html, flags=re.IGNORECASE)
+
+    return html.strip()
 
 
 async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
@@ -211,27 +232,22 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
         page = await ctx.new_page()
         page.set_default_timeout(YOPMAIL_NAV_TIMEOUT)
 
-        # เปิด homepage
         await page.goto("https://yopmail.com/en/", wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
 
-        # ใส่ email
         try:
             await page.fill("#login", shortname, timeout=8000)
             await page.wait_for_timeout(500)
-        except Exception:
-            pass
+        except Exception: pass
 
-        # กดปุ่ม
         try:
             await page.click("#refreshbut .md, #refreshbut", timeout=5000)
         except Exception:
-            inbox_url = f"https://yopmail.com/en/wm?login={urllib.parse.quote(shortname)}"
-            await page.goto(inbox_url, wait_until="domcontentloaded")
+            await page.goto(f"https://yopmail.com/en/wm?login={urllib.parse.quote(shortname)}",
+                            wait_until="domcontentloaded")
 
         await page.wait_for_timeout(2000)
 
-        # ตรวจสอบและแก้ captcha
         for _ in range(2):
             solved = await _detect_and_solve_captcha(page)
             if solved:
@@ -241,24 +257,18 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
                     if submit:
                         await submit.click()
                         await page.wait_for_timeout(2500)
-                except Exception:
-                    pass
+                except Exception: pass
             else:
                 break
 
-        # หา inbox frame
         list_frame = None
         for f in page.frames:
             try:
-                fname = (f.name or "").lower()
-                furl = (f.url or "").lower()
-                if "ifinbox" in fname or "inbox" in furl:
+                if "ifinbox" in (f.name or "").lower() or "inbox" in (f.url or "").lower():
                     list_frame = f
                     break
-            except Exception:
-                continue
+            except Exception: continue
 
-        # คลิกอีเมลแรก
         first_mail_data = None
         try:
             if list_frame:
@@ -284,7 +294,6 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
         except Exception:
             logger.exception("[yopmail] click first mail failed")
 
-        # captcha รอบ 2 (กรณีคลิกแล้วเจอ)
         if not first_mail_data:
             solved = await _detect_and_solve_captcha(page)
             if solved:
@@ -294,8 +303,7 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
                         if "ifinbox" in (f.name or "").lower() or "inbox" in (f.url or "").lower():
                             list_frame = f
                             break
-                    except Exception:
-                        continue
+                    except Exception: continue
                 if list_frame:
                     try:
                         await list_frame.wait_for_selector("button.lm, div.m", timeout=6000)
@@ -317,20 +325,21 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
                             first_mail_data = {"subject": subject, "from": sender, "date": date}
                             await first_mail.click()
                             await page.wait_for_timeout(1800)
-                    except Exception:
-                        pass
+                    except Exception: pass
 
         if not first_mail_data:
             return {"success": False, "message": "ยังไม่มีอีเมลในกล่อง หรือระบบติด CAPTCHA", "empty": True}
 
-        # ดึง HTML
+        # ── ดึง HTML เฉพาะจาก iframe ของอีเมล (ifmail) ──
+        # อย่าใช้ body ของ frame หลัก เพราะจะติด toolbar ของ Yopmail
         mail_html = ""
         mail_text = ""
         for f in page.frames:
             try:
                 fname = (f.name or "").lower()
                 furl = (f.url or "").lower()
-                if "ifmail" in fname or "/mail?" in furl or "/m?" in furl:
+                # ifmail = frame ของเนื้อหาอีเมลล้วนๆ (ไม่มี toolbar)
+                if "ifmail" in fname or "/mail?b=" in furl or "/m?b=" in furl:
                     body = await f.query_selector("body")
                     if body:
                         html_content = await body.inner_html()
@@ -339,57 +348,50 @@ async def _fetch_latest_email(shortname: str, code_extractor) -> Dict[str, Any]:
                             mail_html = html_content
                             mail_text = text_content or ""
                             break
-            except Exception:
-                continue
+            except Exception: continue
 
+        # fallback: เลือก frame ที่ text ยาวที่สุด (น่าจะเป็นเนื้อหาอีเมล)
         if not mail_html:
+            best_len = 0
             for f in page.frames:
                 try:
+                    # ข้าม inbox list frame
+                    if "ifinbox" in (f.name or "").lower():
+                        continue
                     body = await f.query_selector("body")
                     if body:
-                        html_content = await body.inner_html()
                         text_content = await body.inner_text() or ""
-                        if len(text_content) > len(mail_text):
-                            mail_html = html_content
+                        if len(text_content) > best_len:
+                            best_len = len(text_content)
+                            mail_html = await body.inner_html()
                             mail_text = text_content
-                except Exception:
-                    continue
+                except Exception: continue
 
         if not mail_html:
             return {"success": False, "message": "อ่านเนื้อหาอีเมลไม่สำเร็จ"}
 
+        # ── ทำความสะอาด HTML ──
+        clean_html = _clean_email_html(mail_html)
+
+        # ── ดึง code จาก text ──
         code = None
         try:
             search_text = mail_text or html_mod.unescape(re.sub(r"<[^>]+>", " ", mail_html))
             code = code_extractor(search_text)
-        except Exception:
-            pass
+        except Exception: pass
 
         return {
             "success": True,
             "subject": first_mail_data.get("subject", ""),
             "from": first_mail_data.get("from", ""),
             "date": first_mail_data.get("date", ""),
-            "html": _sanitize_html(mail_html),
+            "html": clean_html,
             "code": code or "",
         }
     finally:
         try:
             await ctx.close()
-        except Exception:
-            pass
-
-
-def _sanitize_html(html: str) -> str:
-    if not html:
-        return ""
-    html = re.sub(r"<script[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
-    html = re.sub(r"<style[\s\S]*?</style>", "", html, flags=re.IGNORECASE)
-    html = re.sub(r"<iframe[\s\S]*?</iframe>", "", html, flags=re.IGNORECASE)
-    html = re.sub(r"\son\w+\s*=\s*\"[^\"]*\"", "", html, flags=re.IGNORECASE)
-    html = re.sub(r"\son\w+\s*=\s*'[^']*'", "", html, flags=re.IGNORECASE)
-    html = re.sub(r"javascript:", "blocked:", html, flags=re.IGNORECASE)
-    return html
+        except Exception: pass
 
 
 def register_yopmail_routes(app: FastAPI, code_extractor):
@@ -420,10 +422,8 @@ def register_yopmail_routes(app: FastAPI, code_extractor):
             try:
                 t0 = time.time()
                 result = await _fetch_latest_email(shortname, code_extractor)
-                logger.info(
-                    "[yopmail] fetch %s in %.2fs success=%s",
-                    shortname, time.time() - t0, result.get("success")
-                )
+                logger.info("[yopmail] fetch %s in %.2fs success=%s",
+                            shortname, time.time() - t0, result.get("success"))
                 return result
             except Exception:
                 logger.exception("[yopmail] fetch failed")
