@@ -4,4 +4,3 @@ pydantic
 telethon
 httpx
 gunicorn
-playwright==1.48.0
