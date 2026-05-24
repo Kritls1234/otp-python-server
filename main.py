@@ -79,7 +79,6 @@ logger = logging.getLogger("otp-server")
 # APP / CLIENTS (DUAL ACCOUNT)
 # =========================
 app = FastAPI(title="OTP Python Server")
-register_yopmail_routes(app, extract_code)
 # ── Client 1 ────────────────────────────────────────────────
 client1 = TelegramClient(
     StringSession(TG_STRING_SESSION_1),
@@ -1480,7 +1479,8 @@ def extract_buttons(message: Any) -> List[Dict[str, Any]]:
                 "col":  col_index,
             })
     return buttons
-
+    
+register_yopmail_routes(app, extract_code)
 # =========================
 # SPECIAL BOT (FAULTYHHBOT)
 # =========================
