@@ -4,3 +4,4 @@ pydantic
 telethon
 httpx
 gunicorn
+playwright
