@@ -22,25 +22,26 @@ from yopmail_browser import yopmail_startup, yopmail_shutdown, register_yopmail_
 # =========================
 # ENV CONFIG
 # =========================
-# ── Account 1 (default) ─────────────────────────────────────
+# -- Account 1 (default) --
 API_ID_1            = int(os.getenv("TG_API_ID", "0"))
 API_HASH_1          = os.getenv("TG_API_HASH", "")
 TG_STRING_SESSION_1 = os.getenv("TG_STRING_SESSION", "")
 
-# ── Account 2 (secondary) ───────────────────────────────────
+# -- Account 2 (secondary) --
 API_ID_2            = int(os.getenv("TG_API_ID_2", "0"))
 API_HASH_2          = os.getenv("TG_API_HASH_2", "")
 TG_STRING_SESSION_2 = os.getenv("TG_STRING_SESSION_2", "")
 
 TIMEOUT_SECONDS             = float(os.getenv("TIMEOUT_SECONDS", "35"))
-# Per-account timeout overrides (fall back to TIMEOUT_SECONDS if not set)
 TIMEOUT_SECONDS_ACCOUNT1    = float(os.getenv("TIMEOUT_SECONDS_ACCOUNT1", str(TIMEOUT_SECONDS)))
 TIMEOUT_SECONDS_ACCOUNT2    = float(os.getenv("TIMEOUT_SECONDS_ACCOUNT2", "90"))
 SEMAPHORE_LIMIT             = int(os.getenv("SEMAPHORE_LIMIT", "15"))
 POLL_INTERVAL               = float(os.getenv("POLL_INTERVAL", "0.22"))
 MESSAGE_LIMIT               = int(os.getenv("MESSAGE_LIMIT", "18"))
-SAFE_SAME_BOT_QUEUE         = os.getenv("SAFE_SAME_BOT_QUEUE", "false").lower() == "true"
-ALLOW_UNMATCHED_CONCURRENT  = os.getenv("ALLOW_UNMATCHED_CONCURRENT", "true").lower() == "true"
+# -- เปลี่ยน default เป็น true: เปิดคิวต่อ bot เดียวกัน กันคำขอปนกันเวลาหลายคนกดพร้อมกัน --
+SAFE_SAME_BOT_QUEUE         = os.getenv("SAFE_SAME_BOT_QUEUE", "true").lower() == "true"
+# -- ปิด default: ไม่ยอมรับข้อความที่อีเมลไม่ตรงอีกต่อไป (กันดึงโค้ดผิดคน) --
+ALLOW_UNMATCHED_CONCURRENT  = os.getenv("ALLOW_UNMATCHED_CONCURRENT", "false").lower() == "true"
 USE_EVENT_LISTENER          = os.getenv("USE_EVENT_LISTENER", "true").lower() == "true"
 USE_POLLING_FALLBACK        = os.getenv("USE_POLLING_FALLBACK", "true").lower() == "true"
 KEEPALIVE_INTERVAL          = int(os.getenv("KEEPALIVE_INTERVAL", "300"))
@@ -79,7 +80,6 @@ logger = logging.getLogger("otp-server")
 # APP / CLIENTS (DUAL ACCOUNT)
 # =========================
 app = FastAPI(title="OTP Python Server")
-# ── Client 1 ────────────────────────────────────────────────
 client1 = TelegramClient(
     StringSession(TG_STRING_SESSION_1),
     API_ID_1,
@@ -89,7 +89,6 @@ client1 = TelegramClient(
     auto_reconnect=True,
 )
 
-# ── Client 2 (if configured) ────────────────────────────────
 client2: Optional[TelegramClient] = None
 if API_ID_2 and API_HASH_2 and TG_STRING_SESSION_2:
     client2 = TelegramClient(
@@ -101,16 +100,13 @@ if API_ID_2 and API_HASH_2 and TG_STRING_SESSION_2:
         auto_reconnect=True,
     )
 
-# ── Account registry ────────────────────────────────────────
 CLIENTS: Dict[str, Optional[TelegramClient]] = {
     "account1": client1,
     "account2": client2,
 }
 
 semaphore          = asyncio.Semaphore(SEMAPHORE_LIMIT)
-# entity cache keyed by (account_id, bot_username)
 entity_cache:      Dict[tuple, Any]           = {}
-# bot locks keyed by (account_id, bot_username)
 bot_locks:         Dict[tuple, asyncio.Lock]  = {}
 active_by_bot:     Dict[tuple, int]           = defaultdict(int)
 pending_requests:  Dict[str, Dict[str, Any]]  = {}
@@ -118,16 +114,13 @@ pending_lock       = asyncio.Lock()
 
 
 def normalize_account_id(account_id: Any) -> str:
-    """รับค่าจาก Sheet แล้ว normalize เป็น 'account1' หรือ 'account2'."""
     value = str(account_id or "").strip().lower()
     if value in ("account2", "acc2", "2"):
         return "account2"
-    # default → account1 (รวมถึงค่าว่าง, account1, acc1, 1, อะไรก็ตามที่ไม่ใช่ account2)
     return "account1"
 
 
 def get_client(account_id: str) -> TelegramClient:
-    """คืน TelegramClient ตาม account_id — ไม่ failover."""
     cli = CLIENTS.get(account_id)
     if cli is None:
         raise RuntimeError(f"ระบบยังไม่ได้ตั้งค่า {account_id} กรุณาติดต่อผู้ดูแล")
@@ -135,7 +128,6 @@ def get_client(account_id: str) -> TelegramClient:
 
 
 def get_timeout_for_account(account_id: str) -> float:
-    """คืน timeout (วินาที) ตาม account_id."""
     if account_id == "account2":
         return TIMEOUT_SECONDS_ACCOUNT2
     return TIMEOUT_SECONDS_ACCOUNT1
@@ -168,7 +160,7 @@ class YopmailRequest(BaseModel):
 async def startup() -> None:
     if not API_ID_1 or not API_HASH_1 or not TG_STRING_SESSION_1:
         logger.warning("Missing required Telegram env vars for account1")
-    await yopmail_startup()  # ← เพิ่มบรรทัดนี้
+    await yopmail_startup()
 
     await connect_telegram(client1, "account1")
 
@@ -197,7 +189,7 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown():
-    await yopmail_shutdown()  # ← เพิ่ม
+    await yopmail_shutdown()
     for account_id, cli in CLIENTS.items():
         if cli is None:
             continue
@@ -223,7 +215,7 @@ async def connect_telegram(cli: TelegramClient, account_id: str) -> None:
 
 async def ensure_client_ready(cli: TelegramClient, account_id: str) -> None:
     if not cli.is_connected():
-        logger.warning("[%s] disconnected → reconnecting...", account_id)
+        logger.warning("[%s] disconnected -> reconnecting...", account_id)
         try:
             await cli.connect()
         except Exception as exc:
@@ -235,10 +227,10 @@ async def ensure_client_ready(cli: TelegramClient, account_id: str) -> None:
         if me is None:
             raise RuntimeError("get_me returned None")
     except asyncio.TimeoutError:
-        logger.warning("[%s] get_me() timeout → force reconnecting...", account_id)
+        logger.warning("[%s] get_me() timeout -> force reconnecting...", account_id)
         await _force_reconnect(cli, account_id)
     except Exception:
-        logger.exception("[%s] get_me() failed → force reconnecting...", account_id)
+        logger.exception("[%s] get_me() failed -> force reconnecting...", account_id)
         await _force_reconnect(cli, account_id)
 
 async def _force_reconnect(cli: TelegramClient, account_id: str) -> None:
@@ -267,7 +259,7 @@ async def telegram_keepalive_loop() -> None:
                 continue
             try:
                 if not cli.is_connected():
-                    logger.warning("[keepalive][%s] disconnected → reconnecting...", account_id)
+                    logger.warning("[keepalive][%s] disconnected -> reconnecting...", account_id)
                     await cli.connect()
                     logger.info("[keepalive][%s] reconnected ok", account_id)
                     continue
@@ -278,7 +270,7 @@ async def telegram_keepalive_loop() -> None:
                 logger.info("[keepalive][%s] ok @%s", account_id, getattr(me, "username", "?"))
 
             except asyncio.TimeoutError:
-                logger.warning("[keepalive][%s] get_me() timeout → force reconnecting...", account_id)
+                logger.warning("[keepalive][%s] get_me() timeout -> force reconnecting...", account_id)
                 try:
                     await _force_reconnect(cli, account_id)
                     logger.info("[keepalive][%s] force reconnect ok", account_id)
@@ -361,14 +353,6 @@ async def bhagatflix_debug(email: str = "", action: str = "code") -> Dict[str, A
     result["apiData"]   = api_result.get("data")
     return result
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "OTP Python Server", "version": "1.0"}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "timestamp": time.time()}
-
 @app.post("/get-otp")
 async def get_otp(data: OtpRequest) -> Dict[str, Any]:
     request_id   = make_request_id()
@@ -402,7 +386,6 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
             "requestId":   request_id,
         }
 
-    # ── route to the correct client ─────────────────────────
     try:
         cli = get_client(account_id)
     except RuntimeError as exc:
@@ -542,10 +525,9 @@ async def click_button(data: ButtonRequest) -> Dict[str, Any]:
                 return fail(sanitize_error(exc), request_id)
 
 # =========================
-# YOPMAIL (unchanged — no Telegram needed)
+# YOPMAIL (unchanged)
 # =========================
 class _YopmailIdParser(HTMLParser):
-    """Parse mail IDs from Yopmail inbox HTML"""
     def __init__(self):
         super().__init__()
         self.ids: List[str] = []
@@ -918,7 +900,6 @@ async def dispatch_incoming_message(msg: Any, account_id: str) -> None:
         for key, pending in list(pending_requests.items()):
             if pending.get("done"):
                 continue
-            # only match events from the same account that issued the request
             if pending.get("account_id") != account_id:
                 continue
             after_id = int(pending.get("after_id") or 0)
@@ -1106,7 +1087,7 @@ async def get_new_messages(cli: TelegramClient, target: Any, after_id: int) -> L
     return new_messages
 
 # =========================
-# TELEGRAM HELPERS (now per-client)
+# TELEGRAM HELPERS (per-client)
 # =========================
 async def get_cached_entity(cli: TelegramClient, account_id: str, bot_username: str) -> Any:
     key = (account_id, normalize_bot_username(bot_username))
@@ -1185,45 +1166,55 @@ async def click_target_button(msg: Any, row: int = 0, col: int = 0, button_text:
 # =========================
 # MATCHING / EXTRACTION
 # =========================
+def extract_emails_from_text(text: str) -> List[str]:
+    """ดึงอีเมลทุกตัวที่ปรากฏในข้อความ (lower-case)."""
+    if not text:
+        return []
+    found = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
+    return [e.lower() for e in found]
+
 def is_relevant_message(
     msg: Any, account_id: str, bot_username: str, email: str,
     selected_button: str, special_mode: bool = False
 ) -> bool:
-    text         = html.unescape(msg.message or "")
-    text_lower   = clean_text(text).lower()
-    email_lower  = clean_email(email)
-    bot_key      = (account_id, normalize_bot_username(bot_username))
-    active_count = active_by_bot.get(bot_key, 0)
+    """
+    กฎเดียว เข้มงวด: ข้อความต้องมี 'อีเมลที่ขอ' อยู่ในเนื้อความเท่านั้น
+    - ถ้าไม่เจออีเมลที่ขอ -> ข้ามทันที
+    - ถ้าเจออีเมล 'คนอื่น' แต่ไม่มีอีเมลเรา -> ข้าม (กันดึงโค้ดผิดคน)
+    """
+    email_lower = clean_email(email)
+    if not email_lower:
+        return False
 
-    if email_lower and email_lower in text_lower:
-        return True
+    text       = html.unescape(msg.message or "")
+    text_lower = clean_text(text).lower()
 
-    selected_lower = clean_text(selected_button).lower()
-    no_data = extract_no_data_message(text)
-    if no_data and email_lower and email_lower in text_lower:
-        return True
+    emails_in_msg = extract_emails_from_text(text_lower)
 
-    if active_count <= 1:
-        return True
+    # มีอีเมลในข้อความ -> ต้องมีอีเมลที่ขออยู่ด้วยเท่านั้น
+    if emails_in_msg:
+        return email_lower in emails_in_msg
 
-    if selected_lower:
-        if is_reset_choice(selected_lower):
-            if "reset" in text_lower or "password" in text_lower or extract_urls_from_message(msg):
-                return ALLOW_UNMATCHED_CONCURRENT
-        if is_household_choice(selected_lower):
-            if any(k in text_lower for k in ("travel verify", "household", "travel", "verify")):
-                return ALLOW_UNMATCHED_CONCURRENT
-        if is_sixdigit_choice(selected_lower):
-            if looks_like_code_message(text_lower):
-                return ALLOW_UNMATCHED_CONCURRENT
-        if is_code_choice(selected_lower):
-            if looks_like_code_message(text_lower):
-                return ALLOW_UNMATCHED_CONCURRENT
+    # ไม่มีอีเมลใด ๆ ในข้อความเลย -> เช็คแบบ substring เผื่อ format แปลก
+    return email_lower in text_lower
 
-    if special_mode and ALLOW_UNMATCHED_CONCURRENT:
-        return True
-
-    return False
+def extract_best_code(text: str) -> Optional[str]:
+    """
+    เลือกโค้ดที่ดีที่สุดจาก segment: เน้น 6 หลักก่อน แล้วค่อย 4 หลัก
+    กันปัญหา 633521 โดนตัดเหลือ 6335 และกรองปีออก
+    """
+    if not text:
+        return None
+    candidates = re.findall(r"(?<!\d)(\d{4,8})(?!\d)", text)
+    if not candidates:
+        return None
+    candidates = [c for c in candidates if not re.match(r"^(19|20)\d{2}$", c)]
+    if not candidates:
+        return None
+    # เรียงความสำคัญตามความยาว: 6 > 8 > 7 > 5 > 4
+    priority = {6: 0, 8: 1, 7: 2, 5: 3, 4: 4}
+    candidates.sort(key=lambda c: priority.get(len(c), 9))
+    return candidates[0]
 
 def extract_code_or_link(msg: Any, selected_button: str, request_id: str) -> Optional[Dict[str, Any]]:
     text           = html.unescape(msg.message or "")
@@ -1368,16 +1359,23 @@ def extract_code(text: str) -> Optional[str]:
     if not text:
         return None
     text = html.unescape(text)
-    specific_patterns = [
-        r"Netflix\s*Sign[-\s]*in\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
-        r"Netflix\s*Travel\s*Verify\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
-    ]
-    for pattern in specific_patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            code = extract_first_4_digit_code(m.group(1))
-            if code:
-                return code
+
+    # Netflix Sign-in Code = 6 หลัก -> ใช้ best code (เน้น 6 หลัก)
+    m = re.search(r"Netflix\s*Sign[-\s]*in\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
+                  text, re.IGNORECASE)
+    if m:
+        code = extract_best_code(m.group(1))
+        if code:
+            return code
+
+    # Netflix Travel Verify Code = 4 หลัก -> ลอง 4 หลักก่อน
+    m = re.search(r"Netflix\s*Travel\s*Verify\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
+                  text, re.IGNORECASE)
+    if m:
+        code = extract_first_4_digit_code(m.group(1)) or extract_best_code(m.group(1))
+        if code:
+            return code
+
     label_patterns = [
         r"OTP\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
         r"Verification\s*Code\s*[:：]?\s*([\s\S]*?)(?:Account\s*Country|🌍|$)",
@@ -1392,11 +1390,12 @@ def extract_code(text: str) -> Optional[str]:
     for pattern in label_patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            code = extract_first_4_digit_code(m.group(1)) or extract_first_4_to_8_digit_code(m.group(1))
+            code = extract_best_code(m.group(1))
             if code:
                 return code
+
     if looks_like_code_message(text):
-        code = extract_first_4_digit_code(text) or extract_first_4_to_8_digit_code(text)
+        code = extract_best_code(text)
         if code:
             return code
     return None
@@ -1483,7 +1482,7 @@ def extract_buttons(message: Any) -> List[Dict[str, Any]]:
                 "col":  col_index,
             })
     return buttons
-    
+
 register_yopmail_routes(app, extract_code)
 # =========================
 # SPECIAL BOT (FAULTYHHBOT)
@@ -1495,7 +1494,6 @@ def build_special_command(button_text: str, email: str, row: int = 0, col: int =
         if row == 0 and col == 1: return f"/link {email}"
         if row == 0 and col == 2: return f"/pwlink {email}"
         if row == 0 and col == 3: return f"/verif {email}"
-    # ⚠️ ต้องเช็ค sixdigit ก่อน code เพราะ keyword "code" อยู่ใน "6 หลัก" / "code 6"
     if is_sixdigit_choice(text):  return f"/verif {email}"
     if is_code_choice(text):      return f"/code {email}"
     if is_household_choice(text): return f"/link {email}"
@@ -1510,7 +1508,6 @@ def special_title_from_position(row: int, col: int) -> str:
     return "ข้อมูล"
 
 def is_sixdigit_choice(text: str) -> bool:
-    """จับปุ่ม Code 6 หลัก (sixdigit) — ต้องเช็คก่อน is_code_choice"""
     value = clean_text(text).lower()
     return any(k in value for k in (
         "6 หลัก", "6หลัก", "6 digit", "6digit",
