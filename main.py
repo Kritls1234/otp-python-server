@@ -422,6 +422,7 @@ async def get_otp(data: OtpRequest) -> Dict[str, Any]:
                             {"text": "ขอโค้ดเข้าสู่ระบบ",  "row": 0, "col": 0},
                             {"text": "ยืนยันครัวเรือน",     "row": 0, "col": 1},
                             {"text": "ลิงก์รีเซ็ตรหัสผ่าน", "row": 0, "col": 2},
+                            {"text": "Code 6 หลัก",          "row": 0, "col": 3},
                         ],
                         "messageId":   0,
                         "specialMode": True,
@@ -1212,6 +1213,9 @@ def is_relevant_message(
         if is_household_choice(selected_lower):
             if any(k in text_lower for k in ("travel verify", "household", "travel", "verify")):
                 return ALLOW_UNMATCHED_CONCURRENT
+        if is_sixdigit_choice(selected_lower):
+            if looks_like_code_message(text_lower):
+                return ALLOW_UNMATCHED_CONCURRENT
         if is_code_choice(selected_lower):
             if looks_like_code_message(text_lower):
                 return ALLOW_UNMATCHED_CONCURRENT
@@ -1490,6 +1494,9 @@ def build_special_command(button_text: str, email: str, row: int = 0, col: int =
         if row == 0 and col == 0: return f"/code {email}"
         if row == 0 and col == 1: return f"/link {email}"
         if row == 0 and col == 2: return f"/pwlink {email}"
+        if row == 0 and col == 3: return f"/verif {email}"
+    # ⚠️ ต้องเช็ค sixdigit ก่อน code เพราะ keyword "code" อยู่ใน "6 หลัก" / "code 6"
+    if is_sixdigit_choice(text):  return f"/verif {email}"
     if is_code_choice(text):      return f"/code {email}"
     if is_household_choice(text): return f"/link {email}"
     if is_reset_choice(text):     return f"/pwlink {email}"
@@ -1499,7 +1506,17 @@ def special_title_from_position(row: int, col: int) -> str:
     if row == 0 and col == 0: return "ขอโค้ดเข้าสู่ระบบ"
     if row == 0 and col == 1: return "ยืนยันครัวเรือน"
     if row == 0 and col == 2: return "ลิงก์รีเซ็ตรหัสผ่าน"
+    if row == 0 and col == 3: return "Code 6 หลัก"
     return "ข้อมูล"
+
+def is_sixdigit_choice(text: str) -> bool:
+    """จับปุ่ม Code 6 หลัก (sixdigit) — ต้องเช็คก่อน is_code_choice"""
+    value = clean_text(text).lower()
+    return any(k in value for k in (
+        "6 หลัก", "6หลัก", "6 digit", "6digit",
+        "six digit", "sixdigit", "six-digit",
+        "/verif", "verif"
+    ))
 
 def is_code_choice(text: str) -> bool:
     value = clean_text(text).lower()
