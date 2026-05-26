@@ -1178,9 +1178,10 @@ def is_relevant_message(
     selected_button: str, special_mode: bool = False
 ) -> bool:
     """
-    กฎเดียว เข้มงวด: ข้อความต้องมี 'อีเมลที่ขอ' อยู่ในเนื้อความเท่านั้น
-    - ถ้าไม่เจออีเมลที่ขอ -> ข้ามทันที
-    - ถ้าเจออีเมล 'คนอื่น' แต่ไม่มีอีเมลเรา -> ข้าม (กันดึงโค้ดผิดคน)
+    Logic 2 ชั้น:
+    1) เจออีเมลที่ขอในข้อความ -> รับ
+    2) เจออีเมล 'คนอื่น' แต่ไม่มีของเรา -> ข้าม (กันดึงโค้ดผิดคน)
+    3) ไม่มีอีเมลใด ๆ ในข้อความ (บอทส่วนใหญ่ส่งแค่โค้ด) -> รับตามปกติ
     """
     email_lower = clean_email(email)
     if not email_lower:
@@ -1191,12 +1192,17 @@ def is_relevant_message(
 
     emails_in_msg = extract_emails_from_text(text_lower)
 
-    # มีอีเมลในข้อความ -> ต้องมีอีเมลที่ขออยู่ด้วยเท่านั้น
-    if emails_in_msg:
-        return email_lower in emails_in_msg
+    # 1) เจออีเมลที่ขอในข้อความ -> รับเลย
+    if email_lower in emails_in_msg:
+        return True
 
-    # ไม่มีอีเมลใด ๆ ในข้อความเลย -> เช็คแบบ substring เผื่อ format แปลก
-    return email_lower in text_lower
+    # 2) ข้อความมีอีเมล "คนอื่น" แต่ไม่มีของเรา -> ข้าม (กันดึงโค้ดผิดคน)
+    if emails_in_msg:
+        return False
+
+    # 3) ข้อความไม่มีอีเมลใด ๆ เลย (บอทส่วนใหญ่ส่งแค่โค้ด/ข้อความ Netflix มาตรง ๆ)
+    #    -> รับได้ตามปกติ ส่วนเคสหลายคนพร้อมกันมี bot lock (SAFE_SAME_BOT_QUEUE) คุมคิวอยู่แล้ว
+    return True
 
 def extract_best_code(text: str) -> Optional[str]:
     """
